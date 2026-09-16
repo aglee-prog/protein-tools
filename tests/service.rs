@@ -31,6 +31,13 @@ async fn uniprot(
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     }
     if query.starts_with("accession:") {
+        let identifier = query.split('"').nth(1).unwrap();
+        if identifier.starts_with('P') && identifier[1..].chars().all(|c| c.is_ascii_digit()) {
+            return (
+                StatusCode::OK,
+                Json(json!({"results": [record(identifier, true)]})),
+            );
+        }
         return (StatusCode::BAD_REQUEST, Json(json!({})));
     }
     let records = if query.contains("AMBIGUOUS") {
@@ -199,4 +206,175 @@ fn go_deduplication_keeps_negation_and_filters_other_products() {
     let normalized =
         protein_tools::quickgo::normalize(serde_json::from_value(input).unwrap(), "P04637");
     assert_eq!(normalized.len(), 2);
+}
+
+async fn serve_app(app: App) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, protein_tools::api::router(app))
+            .await
+            .unwrap();
+    });
+    (url, task)
+}
+
+#[tokio::test]
+async fn public_limits_large_mixed_batches_and_cache() {
+    let (app, calls, _dir, upstream_task) = setup().await;
+    let (url, task) = serve_app(app).await;
+    let client = reqwest::Client::new();
+    for count in [0, 501] {
+        let response = client
+            .post(format!("{url}/protein-info"))
+            .json(&json!({"proteins":vec!["TP53"; count]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains("1 to 500"));
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    for count in [70, 200, 230, 500] {
+        let proteins: Vec<_> = (0..count).map(|i| format!("P{i:05}")).collect();
+        let before = calls.lock().unwrap().len();
+        let response = client
+            .post(format!("{url}/protein-info"))
+            .json(&json!({"proteins": proteins, "organism":"Homo sapiens"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let results: Vec<ProteinResult> = response.json().await.unwrap();
+        assert_eq!(
+            results.iter().map(|r| &r.query).collect::<Vec<_>>(),
+            proteins.iter().collect::<Vec<_>>()
+        );
+        assert!(results.iter().all(|r| r.found && r.error.is_none()));
+        let cached = match count {
+            70 => 0,
+            200 => 70,
+            230 => 200,
+            500 => 230,
+            _ => unreachable!(),
+        };
+        assert_eq!(results.iter().filter(|r| r.cached).count(), cached);
+        // One accession lookup and two QuickGO pages per uncached identifier.
+        assert_eq!(calls.lock().unwrap().len() - before, (count - cached) * 3);
+        let before = calls.lock().unwrap().len();
+        let results: Vec<ProteinResult> = client
+            .post(format!("{url}/protein-info"))
+            .json(&json!({"proteins": proteins, "organism":"Homo sapiens"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(results.iter().all(|r| r.cached));
+        assert_eq!(calls.lock().unwrap().len(), before);
+    }
+    let schema: Value = client
+        .get(format!("{url}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        schema["components"]["schemas"]["ProteinRequest"]["properties"]["proteins"]["maxItems"],
+        500
+    );
+    assert!(
+        schema["paths"]["/protein-info"]["post"]
+            .to_string()
+            .contains("complete protein list")
+    );
+    task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn duplicates_share_successes_and_failures_and_keep_original_queries() {
+    let (app, calls, _dir, task) = setup().await;
+    let proteins = vec!["TP53", "FAIL", " tp53 ", "MISSING", "fail", "missing"];
+    let results = app
+        .batch(ProteinRequest {
+            proteins: proteins.iter().map(|s| (*s).into()).collect(),
+            organism: None,
+        })
+        .await;
+    assert_eq!(
+        results.iter().map(|r| r.query.as_str()).collect::<Vec<_>>(),
+        proteins
+    );
+    assert!(results[0].found && results[2].found);
+    assert!(results[1].error.is_some() && results[4].error.is_some());
+    assert!(!results[3].found && !results[5].found);
+    assert!(results.iter().all(|r| !r.cached));
+    assert_eq!(calls.lock().unwrap().len(), 7);
+    task.abort();
+}
+
+#[tokio::test]
+async fn concurrent_completion_keeps_order_and_shared_limit() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[derive(Clone, Default)]
+    struct Mock {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        finished: Arc<Mutex<Vec<String>>>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+    let mock = Mock::default();
+    let state = mock.clone();
+    let router = Router::new().route("/uniprotkb/search", get(
+        |State(mock): State<Mock>, Query(params): Query<HashMap<String, String>>| async move {
+            let query = params["query"].split('"').nth(1).unwrap().to_string();
+            let active = mock.active.fetch_add(1, Ordering::SeqCst) + 1;
+            mock.peak.fetch_max(active, Ordering::SeqCst);
+            if query == "P00000" {
+                mock.gate.notified().await;
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            mock.finished.lock().unwrap().push(query.clone());
+            if query == "P00001" { mock.gate.notify_one(); }
+            mock.active.fetch_sub(1, Ordering::SeqCst);
+            // Isolated upstream failures also preserve the response shape.
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+        }
+    )).with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (mut app, _calls, _dir, other_task) = setup().await;
+    app.upstream = Upstream::new(url.clone(), url).unwrap();
+    let request = |start| ProteinRequest {
+        proteins: (start..start + 70).map(|i| format!("P{i:05}")).collect(),
+        organism: None,
+    };
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        tokio::join!(app.batch(request(0)), app.batch(request(70)))
+    })
+    .await
+    .unwrap();
+    for (results, start) in [(a, 0), (b, 70)] {
+        assert_eq!(
+            results.iter().map(|r| r.query.clone()).collect::<Vec<_>>(),
+            request(start).proteins
+        );
+        assert!(results.iter().all(|r| !r.found && r.error.is_some()));
+    }
+    let finished = mock.finished.lock().unwrap();
+    assert!(
+        finished.iter().position(|q| q == "P00001").unwrap()
+            < finished.iter().position(|q| q == "P00000").unwrap()
+    );
+    assert!((2..=4).contains(&mock.peak.load(Ordering::SeqCst)));
+    task.abort();
+    other_task.abort();
 }

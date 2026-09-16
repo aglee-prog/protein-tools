@@ -10,9 +10,12 @@ use axum::{
     routing::{get, post},
 };
 use futures::{StreamExt, stream};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tokio::sync::Semaphore;
 use utoipa::OpenApi;
+
+pub const MAX_REQUEST_PROTEINS: usize = 500;
+pub const MAX_CONCURRENT_LOOKUPS: usize = 4;
 
 #[derive(Clone)]
 pub struct App {
@@ -32,7 +35,7 @@ impl App {
         };
         match self.cache.get(key.clone()).await {
             Ok(Some(mut result)) => {
-                tracing::info!(event="cache_hit", query=%key.0);
+                tracing::debug!(event="cache_hit", query=%key.0);
                 result.query = query;
                 result.cached = true;
                 return result;
@@ -40,7 +43,7 @@ impl App {
             Err(error) => tracing::warn!(event="cache_read_failure", %error),
             _ => {}
         }
-        tracing::info!(event="cache_miss", query=%key.0);
+        tracing::debug!(event="cache_miss", query=%key.0);
         let mut result = match self.upstream.resolve(&key.0, &key.1).await {
             Ok(Some(result)) => result,
             Ok(None) => return ProteinResult::missing(&query, None),
@@ -64,28 +67,59 @@ impl App {
         result
     }
     pub async fn batch(&self, request: ProteinRequest) -> Vec<ProteinResult> {
-        stream::iter(
-            request
-                .proteins
+        let mut indices = HashMap::new();
+        let mut unique = Vec::new();
+        let mut order = Vec::with_capacity(request.proteins.len());
+        for query in &request.proteins {
+            let key = normalize(query, request.organism.as_deref());
+            let index = *indices.entry(key).or_insert_with(|| {
+                unique.push(query.clone());
+                unique.len() - 1
+            });
+            order.push(index);
+        }
+        let results: Vec<_> = stream::iter(
+            unique
                 .into_iter()
                 .map(|query| self.lookup(query, request.organism.clone())),
         )
-        .buffered(4)
+        .buffered(MAX_CONCURRENT_LOOKUPS)
         .collect()
-        .await
+        .await;
+        let cache_hits = results.iter().filter(|result| result.cached).count();
+        let resolved_count = order.iter().filter(|&&index| results[index].found).count();
+        tracing::info!(
+            event = "protein_request_summary",
+            requested_count = order.len(),
+            unique_count = results.len(),
+            cache_hits,
+            cache_misses = results.len() - cache_hits,
+            resolved_count,
+            unresolved_count = order.len() - resolved_count,
+        );
+        request
+            .proteins
+            .into_iter()
+            .zip(order)
+            .map(|(query, index)| {
+                let mut result = results[index].clone();
+                result.query = query;
+                result
+            })
+            .collect()
     }
 }
 #[utoipa::path(post, path="/protein-info", operation_id="lookupProteinInfo", request_body=ProteinRequest,
     responses((status=200, description="One result per input, in input order. found indicates UniProt resolution; error may indicate incomplete QuickGO annotations. Only complete successful results are cached.", body=Vec<ProteinResult>), (status=400, description="Invalid batch size or organism")))]
-/// Look up authoritative protein information from UniProt and Gene Ontology annotations from QuickGO. Use this operation instead of relying on model memory when identifying, analyzing, comparing, or grouping proteins. This service only retrieves facts; it does not interpret, classify, or group proteins. Only exact accessions or gene symbols are resolved; ambiguous matches are reported as unresolved.
+/// Look up authoritative UniProt and Gene Ontology information for up to 500 proteins. Send the complete protein list in one request; clients should not manually split lists into multiple tool calls. The service handles batching, bounded concurrency, and caching internally. This service only retrieves facts; it does not interpret, classify, or group proteins. Only exact accessions or gene symbols are resolved; ambiguous matches are reported as unresolved.
 async fn protein_info(
     State(app): State<App>,
     Json(request): Json<ProteinRequest>,
 ) -> Result<Json<Vec<ProteinResult>>, (StatusCode, &'static str)> {
-    if request.proteins.is_empty() || request.proteins.len() > 50 {
+    if request.proteins.is_empty() || request.proteins.len() > MAX_REQUEST_PROTEINS {
         return Err((
             StatusCode::BAD_REQUEST,
-            "proteins must contain 1 to 50 identifiers",
+            "proteins must contain 1 to 500 identifiers",
         ));
     }
     if request

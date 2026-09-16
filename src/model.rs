@@ -3,8 +3,8 @@ use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]
 pub struct ProteinRequest {
-    /// Gene symbols or UniProt accessions; 1 to 50 identifiers.
-    #[schema(min_items = 1, max_items = 50)]
+    /// Gene symbols or UniProt accessions; send the complete set of 1 to 500 identifiers in one request.
+    #[schema(min_items = 1, max_items = 500)]
     pub proteins: Vec<String>,
     /// Optional scientific organism name, for example Homo sapiens.
     pub organism: Option<String>,

@@ -1,0 +1,12 @@
+{
+  "proteins": [
+    "TP53", "EGFR", "AKT1", "BRCA1", "BRCA2", "KRAS", "HRAS", "NRAS", "BRAF", "RAF1",
+    "MAP2K1", "MAP2K2", "MAPK1", "MAPK3", "MTOR", "PTEN", "PIK3CA", "PIK3CB", "PIK3CD", "PIK3R1",
+    "STAT1", "STAT3", "STAT5A", "JAK1", "JAK2", "SRC", "ABL1", "KIT", "MET", "ERBB2",
+    "ERBB3", "ERBB4", "FGFR1", "FGFR2", "FGFR3", "VEGFA", "KDR", "FLT1", "PDGFRA", "PDGFRB",
+    "RB1", "CDK1", "CDK2", "CDK4", "CDK6", "CCND1", "CCNE1", "CDKN1A", "CDKN1B", "CDKN2A",
+    "BCL2", "BAX", "BAK1", "CASP3", "CASP8", "CASP9", "APAF1", "MDM2", "MYC", "FOS",
+    "JUN", "NFKB1", "RELA", "CTNNB1", "APC", "GSK3B", "SMAD2", "SMAD3", "SMAD4", "TGFB1"
+  ],
+  "organism": "Homo sapiens"
+}

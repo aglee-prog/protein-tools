@@ -1,5 +1,5 @@
 use protein_tools::{
-    api::{App, router},
+    api::{App, MAX_CONCURRENT_LOOKUPS, router},
     cache::Cache,
     upstream::Upstream,
 };
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "https://rest.uniprot.org".into(),
             "https://www.ebi.ac.uk/QuickGO/services".into(),
         )?,
-        permits: Arc::new(Semaphore::new(4)),
+        permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOOKUPS)),
     };
     let address = env::var("BIND_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = tokio::net::TcpListener::bind(&address).await?;
