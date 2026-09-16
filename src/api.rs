@@ -1,11 +1,11 @@
 use crate::{
     cache::Cache,
-    model::{ProteinRequest, ProteinResult, normalize},
+    model::{ProteinRequest, ProteinResponse, ProteinResult, default_include, normalize},
     upstream::Upstream,
 };
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     http::StatusCode,
     routing::{get, post},
 };
@@ -110,16 +110,17 @@ impl App {
     }
 }
 #[utoipa::path(post, path="/protein-info", operation_id="lookupProteinInfo", request_body=ProteinRequest,
-    responses((status=200, description="One result per input, in input order. found indicates UniProt resolution; error may indicate incomplete QuickGO annotations. Only complete successful results are cached.", body=Vec<ProteinResult>), (status=400, description="Invalid batch size or organism")))]
-/// Look up authoritative UniProt and Gene Ontology information for up to 500 proteins. Send the complete protein list in one request; clients should not manually split lists into multiple tool calls. The service handles batching, bounded concurrency, and caching internally. This service only retrieves facts; it does not interpret, classify, or group proteins. Only exact accessions or gene symbols are resolved; ambiguous matches are reported as unresolved.
+    responses((status=200, description="One result per input, in input order. query, found, cached, and error are always returned; selected fields are included when available. error may indicate incomplete QuickGO annotations.", body=Vec<ProteinResponse>), (status=400, description="Invalid batch size, organism, include value, or GO limit")))]
+/// Look up authoritative UniProt and Gene Ontology information for a protein set. Send the complete protein set in one request. Select only the information needed using `include` and control GO response size with `max_go_terms_per_protein`. The service handles batching, concurrency, and caching internally.
 async fn protein_info(
     State(app): State<App>,
-    Json(request): Json<ProteinRequest>,
-) -> Result<Json<Vec<ProteinResult>>, (StatusCode, &'static str)> {
+    request: Result<Json<ProteinRequest>, JsonRejection>,
+) -> Result<Json<Vec<ProteinResponse>>, (StatusCode, String)> {
+    let Json(request) = request.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     if request.proteins.is_empty() || request.proteins.len() > MAX_REQUEST_PROTEINS {
         return Err((
             StatusCode::BAD_REQUEST,
-            "proteins must contain 1 to 500 identifiers",
+            "proteins must contain 1 to 500 identifiers".into(),
         ));
     }
     if request
@@ -127,9 +128,23 @@ async fn protein_info(
         .as_ref()
         .is_some_and(|o| o.len() > 200 || o.chars().any(char::is_control))
     {
-        return Err((StatusCode::BAD_REQUEST, "invalid organism"));
+        return Err((StatusCode::BAD_REQUEST, "invalid organism".into()));
     }
-    Ok(Json(app.batch(request).await))
+    if request.max_go_terms_per_protein == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "max_go_terms_per_protein must be at least 1".into(),
+        ));
+    }
+    let include = request.include.clone().unwrap_or_else(default_include);
+    let limit = request.max_go_terms_per_protein;
+    Ok(Json(
+        app.batch(request)
+            .await
+            .into_iter()
+            .map(|result| result.select(&include, limit))
+            .collect(),
+    ))
 }
 #[utoipa::path(get, path="/health", operation_id="health", responses((status=200, description="Service is running; upstream reachability is not checked")))]
 async fn health() -> Json<serde_json::Value> {
@@ -138,7 +153,12 @@ async fn health() -> Json<serde_json::Value> {
 #[derive(OpenApi)]
 #[openapi(
     paths(protein_info, health),
-    components(schemas(ProteinRequest, ProteinResult, crate::model::GoAnnotation))
+    components(schemas(
+        ProteinRequest,
+        ProteinResponse,
+        crate::model::Include,
+        crate::model::GoAnnotation
+    ))
 )]
 pub struct ApiDoc;
 pub fn router(app: App) -> Router {

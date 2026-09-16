@@ -61,8 +61,11 @@ async fn quickgo(
         "quickgo:{}:{}",
         params["geneProductId"], params["page"]
     ));
+    let mut results: Vec<Value> = (0..12).map(|i| json!({"geneProductId":"UniProtKB:P04637","goId":format!("GO:{i:07}"),"goAspect":"biological_process","evidenceCode":"ECO:0000269","qualifier":"involved_in"})).collect();
+    results.push(json!({"geneProductId":"UniProtKB:P04637","goId":"GO:0003677","goAspect":"molecular_function","evidenceCode":"ECO:0000269","qualifier":"enables"}));
+    results.push(json!({"geneProductId":"UniProtKB:P04637","goId":"GO:0005575","goAspect":"cellular_component","evidenceCode":"ECO:0000269","qualifier":"located_in"}));
     Json(
-        json!({"pageInfo":{"current":params["page"].parse::<usize>().unwrap(),"total":2},"results":[{"geneProductId":"UniProtKB:P04637","goId":"GO:0003677","goAspect":"molecular_function","evidenceCode":"ECO:0000269","qualifier":"enables"}]}),
+        json!({"pageInfo":{"current":params["page"].parse::<usize>().unwrap(),"total":2},"results":results}),
     )
 }
 async fn setup() -> (App, Calls, tempfile::TempDir, tokio::task::JoinHandle<()>) {
@@ -159,7 +162,7 @@ async fn invalid_accession_falls_back_to_exact_gene_and_cache_skips_all_upstream
         Some("Cellular tumor antigen p53")
     );
     assert_eq!(result.function.as_deref(), Some("Authoritative function."));
-    assert_eq!(result.go_annotations.len(), 1);
+    assert_eq!(result.go_annotations.len(), 14);
     let before = calls.lock().unwrap().clone();
     assert!(before[0].starts_with("accession:"));
     assert!(before[1].starts_with("gene_exact:"));
@@ -184,6 +187,8 @@ async fn one_failure_does_not_invalidate_batch_and_unrelated_hits_are_rejected()
                 "AMBIGUOUS".into(),
             ],
             organism: Some("Homo sapiens".into()),
+            include: None,
+            max_go_terms_per_protein: None,
         })
         .await;
     assert_eq!(results.len(), 4);
@@ -289,7 +294,7 @@ async fn public_limits_large_mixed_batches_and_cache() {
     assert!(
         schema["paths"]["/protein-info"]["post"]
             .to_string()
-            .contains("complete protein list")
+            .contains("complete protein set")
     );
     task.abort();
     upstream_task.abort();
@@ -303,6 +308,8 @@ async fn duplicates_share_successes_and_failures_and_keep_original_queries() {
         .batch(ProteinRequest {
             proteins: proteins.iter().map(|s| (*s).into()).collect(),
             organism: None,
+            include: None,
+            max_go_terms_per_protein: None,
         })
         .await;
     assert_eq!(
@@ -356,6 +363,8 @@ async fn concurrent_completion_keeps_order_and_shared_limit() {
     let request = |start| ProteinRequest {
         proteins: (start..start + 70).map(|i| format!("P{i:05}")).collect(),
         organism: None,
+        include: None,
+        max_go_terms_per_protein: None,
     };
     let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
         tokio::join!(app.batch(request(0)), app.batch(request(70)))
@@ -377,4 +386,225 @@ async fn concurrent_completion_keeps_order_and_shared_limit() {
     assert!((2..=4).contains(&mock.peak.load(Ordering::SeqCst)));
     task.abort();
     other_task.abort();
+}
+
+#[tokio::test]
+async fn selected_fields_limits_evidence_and_cache_are_consistent() {
+    let (app, calls, dir, upstream_task) = setup().await;
+    let cache_path = dir.path().join("cache.sqlite");
+    let (url, task) = serve_app(app).await;
+    let client = reqwest::Client::new();
+    let request = |include: Option<Value>, limit: Option<usize>| {
+        let mut body =
+            json!({"proteins":["TP53", "MISSING", " tp53 ", "TP53"], "organism":"Homo sapiens"});
+        if let Some(include) = include {
+            body["include"] = include;
+        }
+        if let Some(limit) = limit {
+            body["max_go_terms_per_protein"] = json!(limit);
+        }
+        body
+    };
+    let fetch = |body: Value| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            client
+                .post(format!("{url}/protein-info"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .json::<Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let default = fetch(request(None, None)).await;
+    assert_eq!(default[0]["go_annotations"].as_array().unwrap().len(), 12);
+    assert!(default[0].get("uniprot_id").is_some());
+    assert!(default[0].get("function").is_some());
+    assert!(default[0]["go_annotations"][0].get("evidence").is_none());
+    assert_eq!(default[0]["query"], "TP53");
+    assert_eq!(default[2]["query"], " tp53 ");
+    assert_eq!(default[3]["query"], "TP53");
+    assert_eq!(default[1]["found"], false);
+    assert!(default[1].get("error").is_some());
+    let calls_after_first = calls.lock().unwrap().len();
+    let cases = [
+        (json!(["identity"]), None, 0, false, false),
+        (json!(["function"]), None, 0, true, false),
+        (json!(["go.biological_process"]), None, 12, false, false),
+        (json!(["go.molecular_function"]), None, 1, false, false),
+        (json!(["go.cellular_component"]), None, 1, false, false),
+        (
+            json!([
+                "go.biological_process",
+                "go.molecular_function",
+                "go.cellular_component"
+            ]),
+            Some(50),
+            14,
+            false,
+            false,
+        ),
+        (
+            json!([
+                "go.biological_process",
+                "go.molecular_function",
+                "go.cellular_component",
+                "go.evidence"
+            ]),
+            Some(50),
+            14,
+            false,
+            true,
+        ),
+        (json!(["go.biological_process"]), Some(5), 5, false, false),
+        (json!(["go.biological_process"]), Some(51), 12, false, false),
+    ];
+    for (include, limit, count, function, evidence) in cases {
+        let response = fetch(request(Some(include.clone()), limit)).await;
+        let first = &response[0];
+        assert_eq!(first.get("function").is_some(), function);
+        assert_eq!(
+            first.get("uniprot_id").is_some(),
+            include.as_array().unwrap().contains(&json!("identity"))
+        );
+        assert_eq!(
+            first
+                .get("go_annotations")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len),
+            count
+        );
+        assert_eq!(first["cached"], true);
+        if count > 0 {
+            let annotations = first["go_annotations"].as_array().unwrap();
+            if limit == Some(5) {
+                assert_eq!(
+                    annotations,
+                    &default[0]["go_annotations"].as_array().unwrap()[..5]
+                );
+            }
+            assert_eq!(annotations[0].get("evidence").is_some(), evidence);
+            let aspects: Vec<_> = annotations
+                .iter()
+                .map(|a| a["aspect"].as_str().unwrap())
+                .collect();
+            assert!(aspects.iter().all(|aspect| {
+                include
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|field| field == &format!("go.{aspect}"))
+            }));
+            let ids: std::collections::HashSet<_> = annotations
+                .iter()
+                .map(|a| (&a["go_id"], &a["aspect"]))
+                .collect();
+            assert_eq!(ids.len(), annotations.len());
+        }
+        assert_eq!(response[1]["found"], false);
+    }
+    assert_eq!(calls.lock().unwrap().len(), calls_after_first + 9 * 2); // unresolved MISSING is looked up again
+    let entries: i64 = rusqlite::Connection::open(cache_path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM cache", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(entries, 1);
+    task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn invalid_selection_and_go_limits_return_bad_request() {
+    let (app, _calls, _dir, upstream_task) = setup().await;
+    let (url, task) = serve_app(app).await;
+    let client = reqwest::Client::new();
+    for (body, message) in [
+        (
+            json!({"proteins":["TP53"], "include":["go.unknown"]}),
+            "unknown variant",
+        ),
+        (
+            json!({"proteins":["TP53"], "max_go_terms_per_protein":0}),
+            "at least 1",
+        ),
+    ] {
+        let response = client
+            .post(format!("{url}/protein-info"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains(message));
+    }
+    task.abort();
+    upstream_task.abort();
+}
+
+#[test]
+fn large_synthetic_response_limits_total_go_annotations() {
+    use protein_tools::model::{GoAnnotation, Include};
+    let records: Vec<_> = (0..70)
+        .map(|i| {
+            let mut record = ProteinResult::missing(&format!("P{i:05}"), None);
+            record.found = true;
+            record.function = Some("Database function".into());
+            record.go_annotations = (0..45)
+                .map(|j| GoAnnotation {
+                    go_id: format!("GO:{j:07}"),
+                    aspect: Some(
+                        [
+                            "biological_process",
+                            "molecular_function",
+                            "cellular_component",
+                        ][j % 3]
+                            .into(),
+                    ),
+                    evidence: Some("ECO:0000269".into()),
+                    qualifier: None,
+                })
+                .collect();
+            record
+        })
+        .collect();
+    let compact: usize = records
+        .iter()
+        .cloned()
+        .map(|r| {
+            r.select(
+                &[
+                    Include::Identity,
+                    Include::Function,
+                    Include::GoBiologicalProcess,
+                ],
+                Some(5),
+            )
+            .go_annotations
+            .unwrap()
+            .len()
+        })
+        .sum();
+    let full: usize = records
+        .into_iter()
+        .map(|r| {
+            r.select(
+                &[
+                    Include::GoBiologicalProcess,
+                    Include::GoMolecularFunction,
+                    Include::GoCellularComponent,
+                    Include::GoEvidence,
+                ],
+                None,
+            )
+            .go_annotations
+            .unwrap()
+            .len()
+        })
+        .sum();
+    assert_eq!(compact, 70 * 5);
+    assert_eq!(full, 70 * 45);
 }

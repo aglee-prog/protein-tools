@@ -25,6 +25,40 @@ curl --fail-with-body http://127.0.0.1:8091/protein-info \
 
 Send the complete list; do not manually split it into multiple tool calls. The service handles bounded processing and caching internally. Repeat the same call to reuse successful cached results.
 
+For broad functional analysis, request compact identity, function, and Biological Process data:
+
+```json
+{
+  "proteins": ["TP53", "EGFR", "AKT1", "..."],
+  "organism": "Homo sapiens",
+  "include": ["identity", "function", "go.biological_process"],
+  "max_go_terms_per_protein": 10
+}
+```
+
+For identity and function only:
+
+```json
+{
+  "proteins": ["TP53", "EGFR"],
+  "organism": "Homo sapiens",
+  "include": ["identity", "function"]
+}
+```
+
+For a detailed follow-up:
+
+```json
+{
+  "proteins": ["TP53"],
+  "organism": "Homo sapiens",
+  "include": ["identity", "function", "go.biological_process", "go.molecular_function", "go.cellular_component", "go.evidence"],
+  "max_go_terms_per_protein": 50
+}
+```
+
+Detailed requests with evidence are best directed at a small subset of proteins because the response grows with the annotations returned.
+
 For development without Docker:
 
 ```sh
@@ -44,13 +78,15 @@ Configuration:
 
 `POST /protein-info` takes 1–500 gene symbols or UniProt accessions and an optional scientific organism name. The constant `MAX_REQUEST_PROTEINS = 500` is a public safety limit; empty lists and lists exceeding it return HTTP 400. It returns an array in input order, including failures and duplicates. `GET /health` checks only this service. `GET /openapi.json` is generated from Rust types and operation definitions.
 
+`include` is optional and accepts only `identity`, `function`, `go.biological_process`, `go.molecular_function`, `go.cellular_component`, and `go.evidence`. The default is identity, function, and Biological Process. Every result always includes `query`, `found`, `cached`, and `error`; other fields appear only when selected and available. `go.evidence` adds available QuickGO evidence codes to the selected GO aspects and does not select an aspect by itself. GO evidence is otherwise omitted. If `max_go_terms_per_protein` is omitted, all matching GO annotations are returned. An explicit value of at least 1 limits the total annotations across selected aspects for each protein. Annotations are sorted by aspect, GO ID, qualifier, and evidence before truncation. This ordering is deterministic and does not rank biological importance. Invalid selection values or a zero limit return HTTP 400.
+
 Resolution tries the exact accession first, then `gene_exact`. Invalid-accession HTTP 400/404 responses allow the gene strategy to proceed. Returned identifiers and organism scientific names are checked for exact case-insensitive equality. Exact gene names or explicitly listed gene synonyms may match. A unique reviewed Swiss-Prot entry is preferred; multiple remaining records are ambiguous. Generic search is never used. Candidate sets exceeding one 500-record page fail conservatively rather than selecting from incomplete results.
 
 `found` indicates successful UniProt resolution. When QuickGO fails, protein facts remain available with an explicit `error`, an empty annotation list, and no cache write. Consumers must check `error` before treating annotations as complete. Not-found has `found: false` and `error: null`; failures and ambiguity have an error message.
 
 QuickGO pages are fetched sequentially, up to 100 pages of 200 records. Exceeding the limit fails explicitly without caching a partial result. Only annotations for the exact resolved accession are retained. Duplicate normalized tuples are removed. GO qualifiers are retained alongside GO ID, aspect, and evidence, including negation. References and other raw annotation metadata are not returned. No interpretation or term enrichment is performed.
 
-The final successful normalized result is cached under trimmed, case-normalized query and organism keys. TTL uses write time; reads do not refresh it. On hits the original request query is restored and `cached` is true, without upstream requests. Not-found and incomplete/error results are not cached. SQLite uses WAL, a busy timeout, and a mutex on a shared connection; database operations run on Tokio's blocking pool. Cache errors are logged and lookups remain available. Expired keys are replaced on a subsequent successful lookup; there is no background cleanup worker.
+The final successful normalized result is cached under trimmed, case-normalized query and organism keys. Selection and GO limits are applied after reading the complete record, so they do not create separate cache entries. A fresh identity/function-only request still fetches QuickGO to populate that complete record for later requests. TTL uses write time; reads do not refresh it. On hits the original request query is restored and `cached` is true, without upstream requests. Not-found and incomplete/error results are not cached. SQLite uses WAL, a busy timeout, and a mutex on a shared connection; database operations run on Tokio's blocking pool. Cache errors are logged and lookups remain available. Expired keys are replaced on a subsequent successful lookup; there is no background cleanup worker.
 
 One shared HTTPS client has a 5-second connect timeout and 30-second request timeout. There are no automatic retries. `MAX_CONCURRENT_LOOKUPS = 4` controls the shared permits across all requests and each request processes at most four unique entries at once. Each lookup retains the existing per-protein UniProt requests and bounded QuickGO pagination. Normalized duplicates within a request share one lookup, including unresolved/error results, and retain each original query in the output. Their `cached` flags reflect whether that shared result came from SQLite. Simultaneous cache misses across separate requests may still perform duplicate bounded lookups. Large cold requests can take time; clients should allow for upstream latency.
 
