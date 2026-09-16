@@ -1,0 +1,11 @@
+services:
+  protein-tools:
+    build: .
+    ports:
+      - "127.0.0.1:8091:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      CACHE_DB: /data/cache.sqlite
+      CACHE_TTL_DAYS: "30"
+    restart: unless-stopped
