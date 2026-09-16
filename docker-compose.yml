@@ -2,7 +2,7 @@ services:
   protein-tools:
     build: .
     ports:
-      - "127.0.0.1:8091:8080"
+      - "8091:8080"
     volumes:
       - ./data:/data
     environment:
