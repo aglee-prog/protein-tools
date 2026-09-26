@@ -180,7 +180,7 @@ async fn batching_persistence_empty_results_and_aggregation() {
     );
     f.reply("/link/pathway/hsa:1+hsa:1956+hsa:2+hsa:7157", vec![Reply(200, "hsa:1\tpath:hsa04115\nhsa:7157\tpath:hsa04115\nhsa:1956\tpath:hsa04115\nhsa:1956\tpath:hsa05200\n", "")]);
     f.reply(
-        "/list/path:hsa04115+path:hsa05200",
+        "/list/pathway/hsa",
         vec![Reply(
             200,
             "hsa04115\tp53 signaling pathway\npath:hsa05200\tPathways in cancer\n",
@@ -236,10 +236,7 @@ async fn partial_names_retry_and_no_cache_poisoning() {
             Reply(200, "hsa:7157\tpath:hsa04115\nhsa:7157\tpath:hsa05200", ""),
         ],
     );
-    f.reply(
-        "/list/path:hsa04115+path:hsa05200",
-        vec![Reply(200, "hsa04115\tp53", "")],
-    );
+    f.reply("/list/pathway/hsa", vec![Reply(200, "hsa04115\tp53", "")]);
     let result = f
         .provider
         .lookup(&f.cache, &f.upstream, request(&["P04637", "TP53"]))
@@ -257,7 +254,7 @@ async fn partial_names_retry_and_no_cache_poisoning() {
             .is_none()
     );
     f.reply(
-        "/list/path:hsa05200",
+        "/list/pathway/hsa",
         vec![Reply(200, "hsa05200\tCancer", "")],
     );
     let recovered = f
@@ -266,7 +263,7 @@ async fn partial_names_retry_and_no_cache_poisoning() {
         .await;
     assert!(recovered.complete);
     assert_eq!(f.calls().len(), 6);
-    assert_eq!(f.calls().last().unwrap(), "/list/path:hsa05200");
+    assert_eq!(f.calls().last().unwrap(), "/list/pathway/hsa");
     let calls = &f.mock.lock().unwrap().calls;
     assert!(calls[1].1.duration_since(calls[0].1) >= Duration::from_millis(990));
 }
@@ -447,7 +444,7 @@ async fn public_operation_schema_validation_and_membership() {
 }
 
 #[tokio::test]
-async fn pathway_names_use_ten_entry_batches_and_reuse_cached_links() {
+async fn pathway_names_use_one_organism_catalog_and_reuse_cached_links() {
     let f = Fixture::new().await;
     f.cache
         .put_kegg("hsa", "conversion-v1", "P04637", vec!["hsa:7157".into()])
@@ -458,26 +455,14 @@ async fn pathway_names_use_ten_entry_batches_and_reuse_cached_links() {
         .put_kegg("hsa", "links-v1", "hsa:7157", paths.clone())
         .await
         .unwrap();
-    let first = format!(
-        "/list/{}",
-        paths[..10]
-            .iter()
-            .map(|id| format!("path:{id}"))
-            .collect::<Vec<_>>()
-            .join("+")
-    );
-    f.reply(&first, vec![Reply(200, "hsa00001\tOne\nhsa00002\tTwo\nhsa00003\tThree\nhsa00004\tFour\nhsa00005\tFive\nhsa00006\tSix\nhsa00007\tSeven\nhsa00008\tEight\nhsa00009\tNine\nhsa00010\tTen", "")]);
-    f.reply(
-        "/list/path:hsa00011",
-        vec![Reply(200, "hsa00011\tEleven", "")],
-    );
+    f.reply("/list/pathway/hsa", vec![Reply(200, "hsa00001\tOne\nhsa00002\tTwo\nhsa00003\tThree\nhsa00004\tFour\nhsa00005\tFive\nhsa00006\tSix\nhsa00007\tSeven\nhsa00008\tEight\nhsa00009\tNine\nhsa00010\tTen\nhsa00011\tEleven", "")]);
     let result = f
         .provider
         .lookup(&f.cache, &f.upstream, request(&["P04637"]))
         .await;
     assert!(result.complete);
     assert_eq!(result.pathways.len(), 11);
-    assert_eq!(f.calls().len(), 2);
+    assert_eq!(f.calls().len(), 1);
     assert!(f.calls().iter().all(|p| p.starts_with("/list/")));
     assert!(!result.proteins[0].cached);
     let result = f
@@ -485,7 +470,7 @@ async fn pathway_names_use_ten_entry_batches_and_reuse_cached_links() {
         .lookup(&f.cache, &f.upstream, request(&["P04637"]))
         .await;
     assert!(result.proteins[0].cached);
-    assert_eq!(f.calls().len(), 2);
+    assert_eq!(f.calls().len(), 1);
 }
 
 #[tokio::test]
@@ -556,7 +541,7 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         )],
     );
     f.reply(
-        "/list/path:hsa04115",
+        "/list/pathway/hsa",
         vec![Reply(
             200,
             "hsa04115\tp53 signaling pathway - Homo sapiens",
@@ -572,7 +557,7 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         vec![Reply(200, "mmu:22059\tpath:mmu04115", "")],
     );
     f.reply(
-        "/list/path:mmu04115",
+        "/list/pathway/mmu",
         vec![Reply(
             200,
             "mmu04115\tp53 signaling pathway - Mus musculus",
@@ -588,7 +573,7 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         vec![Reply(200, "rno:24842\tpath:rno04115", "")],
     );
     f.reply(
-        "/list/path:rno04115",
+        "/list/pathway/rno",
         vec![Reply(
             200,
             "rno04115\tp53 signaling pathway - Rattus norvegicus",
@@ -605,7 +590,7 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         vec![Reply(200, "eco:b0001\tpath:eco00010", "")],
     );
     f.reply(
-        "/list/path:eco00010",
+        "/list/pathway/eco",
         vec![Reply(200, "eco00010\tGlycolysis", "")],
     );
     let inputs = [
@@ -796,4 +781,101 @@ async fn organism_resolution_failures_are_not_cached_or_called_unsupported() {
             .count(),
         3
     );
+}
+
+#[tokio::test]
+async fn akt1_names_match_memberships_and_repair_only_invalid_name_cache() {
+    let f = Fixture::cold().await;
+    f.taxonomy("P31749", Some(9606), Some("Homo sapiens"));
+    f.reply(
+        "/link/genome/taxid:9606",
+        vec![Reply(200, "taxid:9606\tgn:hsa\n", "")],
+    );
+    f.reply(
+        "/conv/hsa/up:P31749",
+        vec![Reply(200, "up:P31749\thsa:207\n", "")],
+    );
+    f.reply(
+        "/link/pathway/hsa:207",
+        vec![Reply(
+            200,
+            "hsa:207\tpath:hsa04010\nhsa:207\tpath:hsa04151\n",
+            "",
+        )],
+    );
+    let catalog = "hsa01100\tMetabolic pathways - Homo sapiens (human)\nhsa04010\tMAPK signaling pathway - Homo sapiens (human)\nhsa04151\tPI3K-Akt signaling pathway - Homo sapiens (human)\n";
+    f.reply("/list/pathway/hsa", vec![Reply(200, catalog, "")]);
+    let app = App {
+        cache: f.cache.clone(),
+        kegg: f.provider.clone(),
+        upstream: f.upstream.clone(),
+        permits: Arc::new(Semaphore::new(4)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/kegg-pathways", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router(app)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    // Include legacy null JSON, empty vectors, blank strings and ambiguous names.
+    for invalid in [
+        None,
+        Some(json!([])),
+        Some(json!(null)),
+        Some(json!([null])),
+        Some(json!([""])),
+        Some(json!([" "])),
+        Some(json!(["A", "B"])),
+    ] {
+        let repairing = invalid.is_some();
+        if let Some(value) = invalid {
+            f.cache
+                .put_kegg_value("hsa", "names-v1", "hsa04010", value)
+                .await
+                .unwrap();
+            f.reply("/list/pathway/hsa", vec![Reply(200, catalog, "")]);
+        }
+        let before = f.calls().len();
+        let response: Value = client
+            .post(&url)
+            .json(&json!({"proteins":["P31749"]}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["complete"], true, "{response}");
+        for (i, id, name) in [
+            (
+                0,
+                "hsa04010",
+                "MAPK signaling pathway - Homo sapiens (human)",
+            ),
+            (
+                1,
+                "hsa04151",
+                "PI3K-Akt signaling pathway - Homo sapiens (human)",
+            ),
+        ] {
+            assert_eq!(response["pathways"][i]["pathway_id"], id);
+            assert_eq!(response["pathways"][i]["pathway_name"], name);
+            assert_eq!(response["proteins"][0]["pathways"][i]["pathway_name"], name);
+        }
+        assert_eq!(response["pathways"].as_array().unwrap().len(), 2);
+        if repairing {
+            assert_eq!(&f.calls()[before..], &["/list/pathway/hsa"]);
+        }
+        let calls = f.calls().len();
+        let cache = Cache::open(f.dir.path().join("cache.sqlite").to_str().unwrap(), 30).unwrap();
+        let result = f
+            .provider
+            .lookup(&cache, &f.upstream, request(&["P31749"]))
+            .await;
+        assert!(result.complete && result.proteins[0].cached);
+        assert_eq!(f.calls().len(), calls);
+    }
+    task.abort();
 }

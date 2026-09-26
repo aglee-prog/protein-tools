@@ -192,11 +192,13 @@ The provider uses only the official `https://rest.kegg.jp` API:
 - `/link/genome/taxid:<taxonomy>+taxid:<taxonomy>...` (up to 100 distinct taxonomies).
 - `/conv/<organism>/up:<accession>+up:<accession>...` (up to 100 inputs per organism).
 - `/link/pathway/<organism>:<gene>+...` (up to 100 inputs per organism).
-- `/list/path:<organism><pathway>+...` (up to 10 explicit IDs, the
-  documented list limit).
+- `/list/pathway/<organism>` (one organism catalog when pathway names are missing;
+  only names for requested memberships are retained).
 
-Only requested mappings and their associated pathways are retrieved; no complete
-database is downloaded. All KEGG provider instances and retries in **one service
+Membership IDs (`path:hsa04010`) and catalog IDs (`hsa04010`) normalize to the
+same cache key. Invalid cached names, including empty or null values, are retried
+without invalidating taxonomy, conversion, membership, or valid name entries.
+Only requested gene mappings and memberships are retrieved. All KEGG provider instances and retries in **one service
 process** share a conservative minimum 500 ms request interval (2 requests/sec).
 Multiple replicas do not coordinate their limits; run one instance per shared
 outbound KEGG traffic budget. Resolution uses exact taxonomy links, so an organism

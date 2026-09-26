@@ -167,13 +167,7 @@ impl Stage {
                     .join("+")
             ),
             Self::Links => format!("link/pathway/{}", ids.join("+")),
-            Self::Names => format!(
-                "list/{}",
-                ids.iter()
-                    .map(|id| format!("path:{id}"))
-                    .collect::<Vec<_>>()
-                    .join("+")
-            ),
+            Self::Names => format!("list/pathway/{organism}"),
         }
     }
 }
@@ -225,14 +219,22 @@ fn parse(
             }
             Stage::Names => (organism_pathway(left, organism)?, right.to_owned()),
         };
-        rows.get_mut(&key)
-            .ok_or("KEGG returned an unrequested identifier")?
-            .insert(value);
+        if let Some(values) = rows.get_mut(&key) {
+            values.insert(value);
+        } else if !matches!(stage, Stage::Names) {
+            return Err("KEGG returned an unrequested identifier".into());
+        }
+        // The organism name catalog also contains pathways not in this request.
+        // Validate those rows above, but only retain requested memberships.
     }
     Ok(rows
         .into_iter()
         .map(|(id, values)| (id, values.into_iter().collect()))
         .collect())
+}
+
+fn valid_name(values: &[String]) -> bool {
+    values.len() == 1 && !values[0].trim().is_empty()
 }
 
 fn retry_after(value: &str) -> Option<u64> {
@@ -331,7 +333,7 @@ impl Kegg {
         let mut misses = Vec::new();
         for id in ids {
             match cache.get_kegg(organism, stage.key(), &id).await {
-                Ok(Some(values)) => {
+                Ok(Some(values)) if !matches!(stage, Stage::Names) || valid_name(&values) => {
                     results.insert(
                         id,
                         Ok(Values {
@@ -348,10 +350,10 @@ impl Kegg {
                 }
             }
         }
-        // KEGG list accepts at most 10 explicit entries. Conversion/link URLs
-        // use conservative 100-entry chunks; never request a database-wide dump.
+        // Fetch the organism catalog once for all missing names. KEGG's
+        // explicit-entry list operation does not return organism pathway names.
         let size = if matches!(stage, Stage::Names) {
-            10
+            misses.len().max(1)
         } else {
             BATCH_SIZE
         };
@@ -363,7 +365,7 @@ impl Kegg {
             match parsed {
                 Ok(rows) => {
                     for (id, values) in rows {
-                        if matches!(stage, Stage::Names) && values.len() != 1 {
+                        if matches!(stage, Stage::Names) && !valid_name(&values) {
                             results
                                 .insert(id, Err("KEGG pathway name missing or ambiguous".into()));
                             continue;
