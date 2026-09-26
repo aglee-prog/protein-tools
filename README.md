@@ -209,3 +209,62 @@ headers. Tests use only localhost mocks and temporary SQLite databases.
 See the [official KEGG API manual](https://www.genome.jp/kegg/rest/keggapi.html)
 for endpoint formats and the [KEGG API access conditions](https://www.genome.jp/kegg/rest/)
 for academic-use terms and the published request limit.
+
+## Compact KEGG comparison
+
+`POST /compare-kegg-pathways`, OpenAPI operation **`compareKeggPathways`**, reuses
+`lookupKeggPathways` and its persistent cache. Prefer this operation for comparisons
+that need shared pathways without the raw per-protein associations.
+
+Request (only `proteins` is required):
+
+```json
+{"proteins":["P31749","Q05030"],"min_proteins":2}
+```
+
+`proteins` accepts 2–500 strings; canonical accession validation and normalization
+follow the lookup. Invalid entries become per-input errors, allowing valid entries
+to contribute. `min_proteins` is an optional integer from 1–500 (null or omitted
+means 2). Set it to the distinct accession count for intersection; thresholds above
+the input count return no matches. Duplicate inputs do not increase counts.
+
+Exact response shape (all fields are always present):
+
+```text
+{
+  complete: boolean,
+  protein_count: integer,
+  matched_pathway_count: integer,
+  proteins: [{
+    query: string,
+    uniprot_id: string,
+    status: "mapped" | "no_mapping" | "unsupported_organism" | "no_pathways" | "error",
+    cached: boolean,
+    error: string | null
+  }],
+  pathways: [{
+    pathway_key: string,
+    pathway_name: string | null,
+    proteins: [{uniprot_id: string, kegg_gene_id: string, pathway_id: string}],
+    protein_count: integer
+  }]
+}
+```
+
+Top-level `protein_count` counts distinct syntactically valid canonical accessions,
+including unmapped or failed ones. Statuses retain input order and duplicates.
+`complete` follows lookup semantics: false if any input has an error; unmapped or
+unsupported accessions are successful negative results. Partial known associations
+still contribute. Missing names remain null without discarding membership.
+
+Each pathway's `protein_count` counts distinct accessions. Its `proteins` contains
+unique accession/gene/pathway tuples for provenance (multiple genes can represent
+one protein). Groups are sorted by key, members lexically by accession/gene/pathway.
+Only groups meeting the threshold are returned; status entries have no raw pathways.
+
+Normalization removes the resolved KEGG organism code from each pathway ID and
+validates the remaining five digits, preserving leading zeros. Thus `hsa04151`,
+`mmu04151`, and `rno04151` share key `04151`; four-character organism codes work too.
+Names never establish equivalence. The final ` - organism` catalog suffix is removed
+for display; if normalized names differ, the lexically first available name is used.
+No cache tables, cache keys, or existing lookup request/response schemas change.

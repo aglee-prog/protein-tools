@@ -5,3 +5,5 @@ pub mod model;
 pub mod quickgo;
 pub mod uniprot;
 pub mod upstream;
+
+pub mod kegg_compare;

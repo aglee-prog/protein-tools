@@ -1,3 +1,4 @@
+use crate::kegg_compare::{KeggCompareRequest, KeggCompareResponse};
 use crate::{
     cache::Cache,
     kegg::{Kegg, KeggRequest, KeggResponse, pathway_id},
@@ -182,14 +183,46 @@ async fn kegg_pathways(
         app.kegg.lookup(&app.cache, &app.upstream, request).await,
     ))
 }
+#[utoipa::path(post, path="/compare-kegg-pathways", operation_id="compareKeggPathways", request_body=KeggCompareRequest,
+    responses((status=200, description="Compact shared KEGG pathways across organisms, with per-input statuses. Check complete before interpreting missing matches.", body=KeggCompareResponse), (status=400, description="Invalid batch size or minimum protein count")))]
+/// Compare KEGG pathways for 2–500 UniProt accessions across organisms. Groups by reference pathway number, defaults to at least 2 distinct proteins, and returns only matched pathways with provenance. Use min_proteins equal to the distinct input count for intersection. Reuses lookupKeggPathways provider and persistent cache.
+async fn compare_kegg_pathways(
+    State(app): State<App>,
+    request: Result<Json<KeggCompareRequest>, JsonRejection>,
+) -> Result<Json<KeggCompareResponse>, (StatusCode, String)> {
+    let Json(request) = request.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    if !(2..=MAX_REQUEST_PROTEINS).contains(&request.proteins.len()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "proteins must contain 2 to 500 accessions".into(),
+        ));
+    }
+    if request
+        .min_proteins
+        .is_some_and(|n| n == 0 || n > MAX_REQUEST_PROTEINS)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "min_proteins must be between 1 and 500".into(),
+        ));
+    }
+    Ok(Json(
+        app.kegg.compare(&app.cache, &app.upstream, request).await,
+    ))
+}
 #[utoipa::path(get, path="/health", operation_id="health", responses((status=200, description="Service is running; upstream reachability is not checked")))]
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok"}))
 }
 #[derive(OpenApi)]
 #[openapi(
-    paths(protein_info, kegg_pathways, health),
+    paths(protein_info, kegg_pathways, compare_kegg_pathways, health),
     components(schemas(
+        KeggCompareRequest,
+        KeggCompareResponse,
+        crate::kegg_compare::KeggCompareProtein,
+        crate::kegg_compare::KeggCompareMember,
+        crate::kegg_compare::KeggComparePathway,
         KeggRequest,
         KeggResponse,
         crate::kegg::KeggProtein,
@@ -207,6 +240,7 @@ pub fn router(app: App) -> Router {
     Router::new()
         .route("/protein-info", post(protein_info))
         .route("/kegg-pathways", post(kegg_pathways))
+        .route("/compare-kegg-pathways", post(compare_kegg_pathways))
         .route("/health", get(health))
         .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .with_state(app)

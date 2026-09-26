@@ -560,7 +560,7 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         "/list/pathway/mmu",
         vec![Reply(
             200,
-            "mmu04115\tp53 signaling pathway - Mus musculus",
+            "path:mmu04115\tp53 signaling pathway - Mus musculus",
             "",
         )],
     );
@@ -612,6 +612,19 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
         assert_eq!(protein.kegg_organism_codes, [code]);
         assert!(matches!(protein.status, KeggStatus::Mapped));
         assert!(protein.pathways[0].pathway_id.starts_with(code));
+        // Both prefixed and bare catalog IDs must join the normalized
+        // membership IDs, independently for each organism.
+        let expected_name = format!("p53 signaling pathway - {name}");
+        assert_eq!(
+            protein.pathways[0].pathway_name.as_deref(),
+            Some(expected_name.as_str())
+        );
+        let group = result
+            .pathways
+            .iter()
+            .find(|group| group.pathway_id == protein.pathways[0].pathway_id)
+            .unwrap();
+        assert_eq!(group.pathway_name.as_deref(), Some(expected_name.as_str()));
     }
     assert!(matches!(
         result.proteins[3].status,
@@ -663,6 +676,21 @@ async fn mixed_organisms_resolve_dynamically_and_persist_across_restart() {
     let result = provider.lookup(&cache, &f.upstream, filtered).await;
     assert_eq!(result.pathways.len(), 1);
     assert_eq!(result.pathways[0].uniprot_ids, ["P02340"]);
+    let compared = provider
+        .compare(
+            &cache,
+            &f.upstream,
+            protein_tools::kegg_compare::KeggCompareRequest {
+                proteins: vec!["P04637".into(), "P02340".into(), "P10361".into()],
+                min_proteins: None,
+            },
+        )
+        .await;
+    assert!(compared.complete);
+    assert_eq!(compared.matched_pathway_count, 1);
+    assert_eq!(compared.pathways[0].pathway_key, "04115");
+    assert_eq!(compared.pathways[0].protein_count, 3);
+    assert!(compared.proteins.iter().all(|p| p.cached));
     assert_eq!(f.calls().len(), 14);
 }
 
@@ -877,5 +905,205 @@ async fn akt1_names_match_memberships_and_repair_only_invalid_name_cache() {
         assert!(result.complete && result.proteins[0].cached);
         assert_eq!(f.calls().len(), calls);
     }
+    task.abort();
+}
+
+#[tokio::test]
+async fn compact_comparison_cached_cross_species_thresholds_and_failures() {
+    use protein_tools::kegg_compare::KeggCompareRequest;
+    let f = Fixture::cold().await;
+    for (id, taxid, code, name, gene) in [
+        ("P31749", 9606, "hsa", "Homo sapiens (human)", "207"),
+        ("P00533", 9606, "hsa", "Homo sapiens (human)", "1956"),
+        ("P02340", 10090, "mmu", "Mus musculus (mouse)", "22059"),
+        ("Q05030", 10116, "rno", "Rattus norvegicus (rat)", "24629"),
+        ("P54321", 1234, "abcd", "Example organism", "123"),
+    ] {
+        f.cache
+            .put_kegg_value(
+                "",
+                "uniprot-taxonomy-v1",
+                id,
+                Some(protein_tools::uniprot::ProteinTaxonomy {
+                    ncbi_taxonomy_id: Some(taxid),
+                    organism_name: Some(name.into()),
+                }),
+            )
+            .await
+            .unwrap();
+        f.cache
+            .put_kegg(
+                "",
+                "taxonomy-codes-v1",
+                &taxid.to_string(),
+                vec![code.into()],
+            )
+            .await
+            .unwrap();
+        let gene = format!("{code}:{gene}");
+        f.cache
+            .put_kegg(
+                code,
+                "conversion-v1",
+                id,
+                vec![gene.clone(), format!("{gene}_extra")],
+            )
+            .await
+            .unwrap();
+        for gene in [&gene, &format!("{gene}_extra")] {
+            f.cache
+                .put_kegg(
+                    code,
+                    "links-v1",
+                    gene,
+                    vec![
+                        format!("{code}04151"),
+                        format!("{code}{}", if code == "hsa" { "04010" } else { "04011" }),
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        for key in ["04151", "04010", "04011"] {
+            f.cache
+                .put_kegg(
+                    code,
+                    "names-v1",
+                    &format!("{code}{key}"),
+                    vec![format!("PI3K-Akt signaling pathway - {name}")],
+                )
+                .await
+                .unwrap();
+        }
+    }
+    f.cache
+        .put_kegg_value(
+            "",
+            "uniprot-taxonomy-v1",
+            "Q99999",
+            Option::<protein_tools::uniprot::ProteinTaxonomy>::None,
+        )
+        .await
+        .unwrap();
+    // Reopen the persistent database: comparison consumes exactly the lookup cache schema.
+    let cache = Cache::open(f.dir.path().join("cache.sqlite").to_str().unwrap(), 30).unwrap();
+    for (ids, minimum, count, members) in [
+        (vec!["P31749", "P00533"], None, 2, 2),
+        (vec!["P31749", "P02340"], None, 1, 2),
+        (vec!["P31749", "Q05030"], None, 1, 2),
+        (vec!["P31749", "P02340", "Q05030"], None, 2, 3),
+        (vec!["P31749", "P02340", "Q05030"], Some(3), 1, 3),
+        (vec!["P31749", "P02340"], Some(1), 3, 2),
+        (vec!["P31749", "P02340"], Some(3), 0, 0),
+        (vec!["P31749", "P54321"], None, 1, 2),
+        (vec!["P31749", " p31749 "], None, 0, 0),
+        (vec!["P31749", "P02340", "invalid", "Q99999"], None, 1, 2),
+    ] {
+        let result = f
+            .provider
+            .compare(
+                &cache,
+                &f.upstream,
+                KeggCompareRequest {
+                    proteins: ids.iter().map(|s| s.to_string()).collect(),
+                    min_proteins: minimum,
+                },
+            )
+            .await;
+        assert_eq!(result.matched_pathway_count, count, "{ids:?}");
+        assert_eq!(result.complete, !ids.contains(&"invalid"));
+        if count > 0 {
+            let shared = result
+                .pathways
+                .iter()
+                .find(|p| p.pathway_key == "04151")
+                .unwrap();
+            assert_eq!(shared.protein_count, members);
+            assert_eq!(shared.proteins.len(), members * 2);
+            assert_eq!(
+                shared.pathway_name.as_deref(),
+                Some("PI3K-Akt signaling pathway")
+            );
+        }
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json["proteins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.get("pathways").is_none())
+        );
+        if ids.contains(&"invalid") {
+            assert_eq!(result.protein_count, 3);
+            assert!(result.proteins[2].error.is_some());
+            assert!(matches!(result.proteins[3].status, KeggStatus::NoMapping));
+        } else {
+            assert!(result.proteins.iter().all(|p| p.cached));
+        }
+    }
+    assert!(f.calls().is_empty());
+}
+
+#[tokio::test]
+async fn comparison_http_schema_and_validation() {
+    use utoipa::OpenApi;
+    let schema = serde_json::to_value(protein_tools::api::ApiDoc::openapi()).unwrap();
+    assert_eq!(
+        schema["paths"]["/compare-kegg-pathways"]["post"]["operationId"],
+        "compareKeggPathways"
+    );
+    assert_eq!(
+        schema["components"]["schemas"]["KeggCompareRequest"]["properties"]["proteins"]["minItems"],
+        2
+    );
+    let f = Fixture::new().await;
+    let app = App {
+        cache: f.cache.clone(),
+        kegg: f.provider.clone(),
+        upstream: f.upstream.clone(),
+        permits: Arc::new(Semaphore::new(4)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/compare-kegg-pathways",
+        listener.local_addr().unwrap()
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, router(app)).await.unwrap();
+    });
+    let client = reqwest::Client::new();
+    for input in [
+        json!({"proteins":[]}),
+        json!({"proteins":["P31749"]}),
+        json!({"proteins":vec!["P31749";501]}),
+        json!({"proteins":["P31749","Q05030"],"min_proteins":0}),
+        json!({"proteins":["P31749","Q05030"],"min_proteins":501}),
+    ] {
+        assert_eq!(
+            client
+                .post(&url)
+                .json(&input)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    let result: Value = client
+        .post(&url)
+        .json(&json!({"proteins":["bad","invalid"]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(result["complete"], false);
+    assert_eq!(result["matched_pathway_count"], 0);
+    assert_eq!(result["protein_count"], 0);
+    assert!(f.calls().is_empty());
     task.abort();
 }
