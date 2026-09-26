@@ -103,3 +103,107 @@ cargo test
 Tests use temporary SQLite databases and localhost mock upstream servers, with no live internet dependency. They cover normalization, persistence and expiration, response parsing, exact resolution ordering, invalid-accession fallback, reviewed preference, ambiguity, unrelated-record rejection, batch isolation, GO pagination/deduplication, and cache hits with zero upstream calls. They also exercise public size limits, 70/230/500-entry requests, mixed cached/uncached results, normalized duplicates, out-of-order completion, shared concurrency bounds, and the OpenAPI limit.
 
 Upstream API references: [UniProt query fields](https://www.uniprot.org/help/query-fields) and [QuickGO API](https://www.ebi.ac.uk/QuickGO/api/).
+
+## KEGG pathways (mixed organisms)
+
+`POST /kegg-pathways`, OpenAPI operation **`lookupKeggPathways`**, accepts 1–500
+canonical UniProt accessions from any organism, including mixed-organism sets.
+This repository exposes OpenAPI operations for tool consumers; it does not implement a native MCP transport or a `result_id` store.
+Existing UniProt/QuickGO behavior is unchanged.
+
+```json
+{
+  "proteins": ["P04637", "P02340", "P10361"],
+  "min_proteins": 1
+}
+```
+
+Omit `min_proteins` to obtain every associated pathway. Use 2 for pathways shared
+by at least two distinct supplied accessions, or the number of distinct supplied
+accessions for pathways common to the entire set. Add `"pathway_id": "hsa04115"`
+to obtain supplied-set membership for that pathway (`path:hsa04115` also works).
+Both filters apply only to the `pathways` groups, leaving the per-protein results
+available for inspection. Repeating inputs does not increase membership counts.
+Pathway IDs retain their organism code: `hsa04115`, `mmu04115`, and `rno04115`
+are separate groups, even though their pathway numbers match. Shared-pathway
+counts use exact IDs; cross-species orthology or equivalence is not inferred.
+These are associations reported by KEGG, not statistical enrichment results.
+
+The structured response contains:
+
+- `complete`, which is false if any input failed. Organism metadata is per protein;
+  the former top-level single `organism` field has been removed.
+- `proteins`, in original input order: `query`, normalized `uniprot_id`,
+  `ncbi_taxonomy_id`, `organism_name`, `kegg_organism_codes`, `kegg_gene_ids`,
+  gene/pathway associations with `pathway_id` and `pathway_name`,
+  `status`, `cached`, `error`, and `source: "KEGG"`.
+- `pathways`, sorted by ID: pathway name, distinct sorted `uniprot_ids`,
+  `protein_count`, and source. Only proteins supplied in the request are included.
+
+Organisms are resolved from UniProt metadata using batches of up to 100 exact
+accessions (`accession`, `organism_id`, and `organism_name` fields). KEGG's
+`link/genome/taxid:<id>+...` endpoint then supplies the organism codes for each
+exact NCBI taxonomy ID. There is no hard-coded species table, name matching, or
+fallback to a related species/strain. All returned organism codes are preserved
+because a taxonomy can link to multiple KEGG genomes. Accessions are grouped by
+those codes before conversion and pathway requests. Non-numeric gene locus tags
+are supported as well as NCBI GeneIDs.
+
+Statuses are `mapped`, `no_mapping`, `no_pathways`, `unsupported_organism`, and
+`error`. An unknown primary accession or a supported organism with no KEGG gene
+mapping returns `no_mapping`. A record without a taxonomy ID, or with no KEGG
+organism linked to its exact taxonomy, returns `unsupported_organism`. Both are
+normal per-protein results (`error: null`) and do not mark the batch incomplete.
+Neither proves a lack of biological pathway involvement. Upstream failures
+remain errors and are never cached as unsupported organisms. Gene symbols,
+secondary accessions, and isoform suffixes are not silently converted to primary
+accessions. Trimmed, case-normalized duplicates share work but retain their
+original queries in the output. Multiple gene and organism mappings are retained.
+
+Check `complete` and per-protein `error` before interpreting an empty result or
+an intersection. Batch failures are isolated to affected identifiers; successful
+mappings and links remain available. A failed pathway-name lookup leaves its
+known association present with `pathway_name: null` and an explicit error.
+KEGG HTTP 4xx other than 429 and malformed responses fail explicitly. KEGG network
+errors, 429, and 5xx receive at most three attempts, with backoff and Retry-After
+support. UniProt metadata requests use the existing bounded client without retries.
+A server cooldown longer than 30 seconds returns an error promptly and blocks
+new upstream attempts until the cooldown permits them; cached data remains usable.
+
+KEGG uses the existing `CACHE_DB` SQLite file and `CACHE_TTL_DAYS` (default 30).
+The existing `kegg_cache` table stores normalized per-accession UniProt taxonomy
+metadata, per-taxonomy KEGG organism codes, and per-identifier conversion, link,
+and name results. Organism and stage/version remain part of the keys; taxonomy
+resolution uses a separate global namespace. Successful unknown accessions and
+unsupported taxonomy results are also cached. Repeated lookups, including after
+restart, need no UniProt or KEGG requests while all required entries are fresh.
+New accessions with an already cached taxonomy reuse its organism-code mapping.
+Existing conversion/link/name cache entries remain compatible. Each stage reads
+its cache before batching misses. Successful empty conversions and links are
+cached; errors, malformed bodies, and missing names are not. Writes do not
+replace other stages, and failures leave older entries untouched. Expired data
+is not served as fresh. Cache failures are logged and lookups continue. A
+protein's `cached` flag is true only if every stage it needs came from SQLite.
+Persistence survives restarts; there is no external cache service or cleanup
+worker. Concurrent cold requests can duplicate a miss, but share the rate limit.
+
+The provider uses only the official `https://rest.kegg.jp` API:
+
+- `/link/genome/taxid:<taxonomy>+taxid:<taxonomy>...` (up to 100 distinct taxonomies).
+- `/conv/<organism>/up:<accession>+up:<accession>...` (up to 100 inputs per organism).
+- `/link/pathway/<organism>:<gene>+...` (up to 100 inputs per organism).
+- `/list/path:<organism><pathway>+...` (up to 10 explicit IDs, the
+  documented list limit).
+
+Only requested mappings and their associated pathways are retrieved; no complete
+database is downloaded. All KEGG provider instances and retries in **one service
+process** share a conservative minimum 500 ms request interval (2 requests/sec).
+Multiple replicas do not coordinate their limits; run one instance per shared
+outbound KEGG traffic budget. Resolution uses exact taxonomy links, so an organism
+without such a link is reported as unsupported even if KEGG represents a related
+strain or species. The tiny `httpdate` dependency, already present transitively, parses HTTP-date Retry-After
+headers. Tests use only localhost mocks and temporary SQLite databases.
+
+See the [official KEGG API manual](https://www.genome.jp/kegg/rest/keggapi.html)
+for endpoint formats and the [KEGG API access conditions](https://www.genome.jp/kegg/rest/)
+for academic-use terms and the published request limit.

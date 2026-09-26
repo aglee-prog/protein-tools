@@ -19,6 +19,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "30".into())
         .parse()?;
     let app = App {
+        kegg: protein_tools::kegg::Kegg::new("https://rest.kegg.jp".into())?,
         cache: Cache::open(&path, ttl)?,
         upstream: Upstream::new(
             "https://rest.uniprot.org".into(),

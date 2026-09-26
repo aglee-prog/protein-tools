@@ -81,6 +81,7 @@ async fn setup() -> (App, Calls, tempfile::TempDir, tokio::task::JoinHandle<()>)
     });
     let dir = tempfile::tempdir().unwrap();
     let app = App {
+        kegg: protein_tools::kegg::Kegg::new(url.clone()).unwrap(),
         cache: Cache::open(dir.path().join("cache.sqlite").to_str().unwrap(), 30).unwrap(),
         upstream: Upstream::new(url.clone(), url).unwrap(),
         permits: Arc::new(Semaphore::new(4)),

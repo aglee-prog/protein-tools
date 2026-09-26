@@ -1,5 +1,6 @@
 use crate::{
     cache::Cache,
+    kegg::{Kegg, KeggRequest, KeggResponse, pathway_id},
     model::{ProteinRequest, ProteinResponse, ProteinResult, default_include, normalize},
     upstream::Upstream,
 };
@@ -20,6 +21,7 @@ pub const MAX_CONCURRENT_LOOKUPS: usize = 4;
 #[derive(Clone)]
 pub struct App {
     pub cache: Cache,
+    pub kegg: Kegg,
     pub upstream: Upstream,
     pub permits: Arc<Semaphore>,
 }
@@ -146,14 +148,54 @@ async fn protein_info(
             .collect(),
     ))
 }
+#[utoipa::path(post, path="/kegg-pathways", operation_id="lookupKeggPathways", request_body=KeggRequest,
+    responses((status=200, description="Multi-organism KEGG associations and pathway groups. Check complete and per-protein errors before interpreting missing associations.", body=KeggResponse), (status=400, description="Invalid batch size, pathway ID, or minimum protein count")))]
+/// Look up KEGG pathways for a mixed-organism set of UniProt accessions. Organisms are resolved automatically from UniProt taxonomy and KEGG. Returns per-protein mappings and pathway groups listing supplied members. Use min_proteins=2 for shared pathways or pathway_id to select membership in one pathway. Send the complete set; batching, rate limits, and persistent caching are automatic. Pathway groups retain their organism-specific IDs; no cross-species equivalence, enrichment, or relationships are inferred.
+async fn kegg_pathways(
+    State(app): State<App>,
+    request: Result<Json<KeggRequest>, JsonRejection>,
+) -> Result<Json<KeggResponse>, (StatusCode, String)> {
+    let Json(mut request) =
+        request.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
+    if request.proteins.is_empty() || request.proteins.len() > MAX_REQUEST_PROTEINS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "proteins must contain 1 to 500 accessions".into(),
+        ));
+    }
+    if request
+        .min_proteins
+        .is_some_and(|n| n == 0 || n > MAX_REQUEST_PROTEINS)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "min_proteins must be between 1 and 500".into(),
+        ));
+    }
+    request.pathway_id = request
+        .pathway_id
+        .as_deref()
+        .map(pathway_id)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    Ok(Json(
+        app.kegg.lookup(&app.cache, &app.upstream, request).await,
+    ))
+}
 #[utoipa::path(get, path="/health", operation_id="health", responses((status=200, description="Service is running; upstream reachability is not checked")))]
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok"}))
 }
 #[derive(OpenApi)]
 #[openapi(
-    paths(protein_info, health),
+    paths(protein_info, kegg_pathways, health),
     components(schemas(
+        KeggRequest,
+        KeggResponse,
+        crate::kegg::KeggProtein,
+        crate::kegg::KeggAssociation,
+        crate::kegg::KeggStatus,
+        crate::kegg::KeggPathwayGroup,
         ProteinRequest,
         ProteinResponse,
         crate::model::Include,
@@ -164,6 +206,7 @@ pub struct ApiDoc;
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/protein-info", post(protein_info))
+        .route("/kegg-pathways", post(kegg_pathways))
         .route("/health", get(health))
         .route("/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .with_state(app)

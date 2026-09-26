@@ -173,3 +173,86 @@ impl Upstream {
         Ok(None)
     }
 }
+
+/// Minimal organism metadata used by KEGG; independent of GO annotation lookup.
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct ProteinTaxonomy {
+    pub ncbi_taxonomy_id: Option<u64>,
+    pub organism_name: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaxonomyRecord {
+    primary_accession: String,
+    organism: TaxonomyOrganism,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TaxonomyOrganism {
+    taxon_id: Option<u64>,
+    scientific_name: Option<String>,
+}
+#[derive(Deserialize)]
+struct TaxonomySearch {
+    results: Vec<TaxonomyRecord>,
+}
+impl Upstream {
+    /// Caller supplies validated canonical accessions, in bounded batches.
+    pub async fn taxonomies(
+        &self,
+        accessions: &[String],
+    ) -> Result<std::collections::BTreeMap<String, Option<ProteinTaxonomy>>, String> {
+        let response = self
+            .get(
+                &format!("{}/uniprotkb/search", self.uniprot),
+                &[
+                    (
+                        "query",
+                        accessions
+                            .iter()
+                            .map(|id| format!("accession:{}", quote(id)))
+                            .collect::<Vec<_>>()
+                            .join(" OR "),
+                    ),
+                    ("fields", "accession,organism_id,organism_name".into()),
+                    ("format", "json".into()),
+                    ("size", "500".into()),
+                ],
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "UniProt taxonomy lookup returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        if response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("rel=\"next\""))
+        {
+            return Err("UniProt taxonomy response is incomplete".into());
+        }
+        let search: TaxonomySearch = response
+            .json()
+            .await
+            .map_err(|_| "invalid UniProt taxonomy response")?;
+        let mut results: std::collections::BTreeMap<_, _> =
+            accessions.iter().map(|id| (id.clone(), None)).collect();
+        for record in search.results {
+            // Accession queries may match secondary accessions. Do not assign
+            // another primary accession's taxonomy to an unverified identifier.
+            if let Some(value) = results.get_mut(&record.primary_accession) {
+                if value.is_some() {
+                    return Err("duplicate UniProt taxonomy record".into());
+                }
+                *value = Some(ProteinTaxonomy {
+                    ncbi_taxonomy_id: record.organism.taxon_id.filter(|id| *id > 0),
+                    organism_name: record.organism.scientific_name,
+                });
+            }
+        }
+        Ok(results)
+    }
+}
