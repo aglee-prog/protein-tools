@@ -291,15 +291,41 @@ p-value and FDR. Terms are ordered by FDR, p-value, then GO ID. Top terms may
 be nonsignificant; use their FDR rather than interpreting their presence as
 significance. Protein lists and the full term collection stay outside this response.
 
-`GET /results/{result_id}` retrieves the complete saved result, including every
-tested term, hit accessions, input and background counts, p-values, FDR, resolved
-input accessions, original `input_identifiers`, ordered `identifier_mapping`,
-UniProt release, background query, annotation policy and `universe` metadata.
-The latter records entry/review/gene-ID coverage counts and the exact
-`eligible_accessions` used as the statistical population.
-`POST /enrich-proteins` with `{"result_id":"result_..."}` reanalyzes that protein
-set using the currently cached background. The generic full-result endpoint is
-intended for explicit retrieval; term-level drill-down remains Stage 2.
+Inspect enrichment progressively using the saved `result_id`:
+
+- `GET /results/{result_id}/enrichment/terms?limit=20&offset=0`
+  (`get_enrichment_terms`) returns term statistics without membership or evidence.
+  Ordering is FDR ascending, then p-value, then GO ID. Default limit is 20;
+  larger limits are clamped to 50 and zero is rejected. The response includes
+  `total`, effective `limit`, `offset`, `has_more`, and `items`. Terms may be nonsignificant.
+- `GET /results/{result_id}/enrichment/terms/{term_id}`
+  (`get_enrichment_term`) returns one term's statistics, taxon, method, source,
+  background policy and UniProt release.
+- `GET /results/{result_id}/enrichment/terms/{term_id}/proteins`
+  (`get_enrichment_term_proteins`) returns only that term's canonical input hits
+  and original-to-canonical `identifier_mapping`, preserving aliases, repeated
+  inputs and input order. `hit_count` counts distinct canonical proteins.
+  No extra upstream lookups occur. Use existing protein tools explicitly if evidence is needed.
+
+For example, after enriching the ten DNA damage response genes:
+```sh
+curl --fail-with-body "http://127.0.0.1:8091/results/$RESULT_ID/enrichment/terms?limit=20"
+# Select a GO ID from the returned terms:
+curl --fail-with-body "http://127.0.0.1:8091/results/$RESULT_ID/enrichment/terms/$TERM_ID/proteins"
+```
+
+`GET /results/{result_id}` (`getCachedResult`) preserves complete small results
+and existing protein-batch behavior. Enrichment results exceeding **32 KiB of
+serialized JSON** return metadata only: `result_id`, `type="go_bp_enrichment"`,
+`item_count`, `truncated=true`, and a message directing clients to the selective
+operations. This is explicitly not the full dataset; no partial term list is
+passed off as complete. Enrichment inspection should always use the selective tools.
+The complete saved result (including universe accessions) stays in SQLite with
+its existing TTL and remains selectively inspectable after service restart.
+Invalid IDs and wrong result types return HTTP 400; missing/expired results and
+absent terms return HTTP 404. No statistics are recalculated during inspection.
+`POST /enrich-proteins` with `{"result_id":"result_..."}` still reanalyzes that
+protein set using the currently cached background.
 
 `POST /protein-info` retains its existing JSON array response and additionally
 returns `X-Result-Id` when storage succeeds. That ID identifies the full unfiltered

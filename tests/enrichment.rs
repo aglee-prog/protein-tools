@@ -180,6 +180,7 @@ async fn api_statistics_compact_response_result_reuse_and_restart() {
     assert_eq!(full["items"].as_array().unwrap().len(), 13);
     assert_eq!(full["items"][0]["proteins"].as_array().unwrap().len(), 5);
     assert_eq!(full["uniprot_release"], "test");
+    assert!(full.get("truncated").is_none());
     assert_eq!(calls.lock().unwrap().len(), 2);
     task.abort();
     upstream_task.abort();
@@ -638,25 +639,90 @@ async fn live_uniprot_exact_ten_protein_set() {
         kegg: protein_tools::kegg::Kegg::new("https://rest.kegg.jp".into()).unwrap(),
         permits: Arc::new(Semaphore::new(4)),
     };
-    let response=app.enrich(serde_json::from_value(json!({"proteins":LIVE_SYMBOLS,"organism_taxon":9606,"source":"go_bp","background":"proteome"})).unwrap()).await.unwrap();
-    assert_eq!(response.input_count, 10);
-    let full: Value = app
-        .cache
-        .get_analysis(&response.result_id)
+    let (url, task) = serve(router(app)).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{url}/enrich-proteins"))
+        .json(&json!({"proteins":LIVE_SYMBOLS,"organism_taxon":9606}))
+        .send()
         .await
         .unwrap()
+        .error_for_status()
         .unwrap();
-    assert_eq!(full["input_identifiers"], json!(LIVE_SYMBOLS));
-    for (i, id) in LIVE_ACCESSIONS.iter().enumerate() {
-        assert_eq!(full["identifier_mapping"][i]["canonical"], json!(id));
+    let summary_bytes = response.bytes().await.unwrap();
+    let summary: Value = serde_json::from_slice(&summary_bytes).unwrap();
+    assert_eq!(summary["input_count"], 10);
+    assert!(summary_bytes.len() < 8192);
+    let id = summary["result_id"].as_str().unwrap();
+    let base = format!("{url}/results/{id}/enrichment/terms");
+    let page_bytes = client
+        .get(format!("{base}?limit=20"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let page: Value = serde_json::from_slice(&page_bytes).unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    assert!(page_bytes.len() < 16384);
+    let selected = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| {
+            t["name"].as_str().unwrap().contains("DNA") && t["hit_count"].as_u64().unwrap() > 0
+        })
+        .unwrap_or(&page["items"][0]);
+    let term_id = selected["id"].as_str().unwrap();
+    let hits_bytes = client
+        .get(format!("{base}/{term_id}/proteins"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let hits: Value = serde_json::from_slice(&hits_bytes).unwrap();
+    assert_eq!(hits["hit_count"], selected["hit_count"]);
+    assert!(hits_bytes.len() < 8192);
+    for mapping in hits["identifier_mapping"].as_array().unwrap() {
+        let index = LIVE_SYMBOLS
+            .iter()
+            .position(|s| *s == mapping["input"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(mapping["canonical"], LIVE_ACCESSIONS[index]);
     }
+    let blocked_bytes = client
+        .get(format!("{url}/results/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    let blocked: Value = serde_json::from_slice(&blocked_bytes).unwrap();
+    assert_eq!(blocked["truncated"], true);
+    assert!(blocked_bytes.len() < 1024);
     println!(
-        "live release={} input_count={} N={} proteome_entries={}",
-        full["uniprot_release"],
-        response.input_count,
-        response.background_count,
-        full["universe"]["proteome_entry_count"]
+        "live result_id={id} terms={} selected={} name={} hits={} response_bytes: summary={} page={} proteins={} generic={}",
+        page["total"],
+        term_id,
+        selected["name"],
+        hits["hit_count"],
+        summary_bytes.len(),
+        page_bytes.len(),
+        hits_bytes.len(),
+        blocked_bytes.len()
     );
+    println!("selected input mappings={}", hits["identifier_mapping"]);
+    task.abort();
 }
 
 async fn proteome_fixture(Query(params): Query<HashMap<String, String>>) -> axum::Json<Value> {
@@ -715,4 +781,173 @@ async fn discovery_never_guesses_a_proteome_or_uses_descendants() {
         discovery_task.abort();
         upstream_task.abort();
     }
+}
+
+#[tokio::test]
+async fn selective_inspection_limits_membership_errors_and_restart() {
+    let (app, calls, dir, upstream_task) = setup("").await;
+    let compact = app
+        .enrich(
+            serde_json::from_value(json!({"organism_taxon":9606,
+        "proteins":["GENE0","P00000","P00001"]}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = compact.result_id;
+    let mut full: Value = app.cache.get_analysis(&id).await.unwrap().unwrap();
+    let original_items = full["items"].clone();
+    // Extend a Stage 1 result with tied terms and a large universe, then scramble order.
+    let mut items = original_items.as_array().unwrap().clone();
+    for i in 100..200 {
+        let mut term = items[0].clone();
+        term["id"] = json!(format!("GO:{i:07}"));
+        items.push(term);
+    }
+    items.reverse();
+    full["items"] = json!(items);
+    full["universe"]["eligible_accessions"] = json!(vec!["P99999"; 100000]);
+    app.cache
+        .put_analysis(Some(id.clone()), full)
+        .await
+        .unwrap();
+    let wrong = app
+        .cache
+        .put_analysis(None, json!({"proteins":["P00000"],"items":[]}))
+        .await
+        .unwrap();
+    upstream_task.abort();
+    let mut restarted = app;
+    restarted.cache = Cache::open(dir.path().join("cache.sqlite").to_str().unwrap(), 30).unwrap();
+    let mut expired_app = restarted.clone();
+    expired_app.cache = Cache::open(dir.path().join("cache.sqlite").to_str().unwrap(), 0).unwrap();
+    let (url, task) = serve(router(restarted)).await;
+    let client = reqwest::Client::new();
+    let base = format!("{url}/results/{id}/enrichment/terms");
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let response = client.get(url).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.json::<Value>().await.unwrap()
+        }
+    };
+    let page = get(base.clone()).await;
+    assert_eq!(page["items"].as_array().unwrap().len(), 20);
+    assert_eq!(page["total"], 113);
+    assert_eq!(page["has_more"], true);
+    let large = get(format!("{base}?limit=100000")).await;
+    assert_eq!(large["limit"], 50);
+    assert_eq!(large["items"].as_array().unwrap().len(), 50);
+    for pair in large["items"].as_array().unwrap().windows(2) {
+        let key = |v: &Value| {
+            (
+                v["fdr"].as_f64().unwrap(),
+                v["p_value"].as_f64().unwrap(),
+                v["id"].as_str().unwrap().to_owned(),
+            )
+        };
+        assert!(key(&pair[0]) < key(&pair[1]));
+    }
+    assert_eq!(page, get(base.clone()).await);
+    let next = get(format!("{base}?limit=10&offset=20")).await;
+    assert_eq!(
+        next["items"],
+        json!(large["items"].as_array().unwrap()[20..30])
+    );
+    let end = get(format!("{base}?offset=113")).await;
+    assert_eq!(end["items"], json!([]));
+    assert_eq!(end["has_more"], false);
+    let detail = get(format!("{base}/GO:0000001")).await;
+    assert_eq!(detail["term"]["fdr"], original_items[0]["fdr"]);
+    assert!(detail["term"].get("proteins").is_none());
+    assert!(detail.get("universe").is_none());
+    assert!(page["items"][0].get("proteins").is_none());
+    let hits = get(format!("{base}/GO:0000001/proteins")).await;
+    assert_eq!(hits["proteins"], json!(["P00000", "P00001"]));
+    assert_eq!(hits["hit_count"], 2);
+    assert_eq!(
+        hits["identifier_mapping"],
+        json!([
+        {"input":"GENE0","canonical":"P00000"}, {"input":"P00000","canonical":"P00000"},
+        {"input":"P00001","canonical":"P00001"}])
+    );
+    let empty = get(format!("{base}/GO:0099999/proteins")).await;
+    assert_eq!(empty["proteins"], json!([]));
+    let blocked = get(format!("{url}/results/{id}")).await;
+    assert_eq!(blocked["truncated"], true);
+    assert_eq!(blocked["type"], "go_bp_enrichment");
+    assert_eq!(blocked["item_count"], 113);
+    assert!(
+        blocked["message"]
+            .as_str()
+            .unwrap()
+            .contains("get_enrichment_terms")
+    );
+    assert!(blocked.get("items").is_none());
+    assert!(serde_json::to_vec(&blocked).unwrap().len() < 1024);
+    let protein = get(format!("{url}/results/{wrong}")).await;
+    assert_eq!(protein, json!({"proteins":["P00000"],"items":[]}));
+    for suffix in ["", "/GO:0000001", "/GO:0000001/proteins"] {
+        for (result_id, status, code) in [
+            ("invalid", StatusCode::BAD_REQUEST, "invalid_request"),
+            (
+                "result_00000000000000000000000000000000",
+                StatusCode::NOT_FOUND,
+                "result_not_found",
+            ),
+            (wrong.as_str(), StatusCode::BAD_REQUEST, "wrong_result_type"),
+        ] {
+            let response = client
+                .get(format!(
+                    "{url}/results/{result_id}/enrichment/terms{suffix}"
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                code
+            );
+        }
+    }
+    for (suffix, status) in [
+        ("?limit=0", 400),
+        ("?limit=-1", 400),
+        ("/bad", 400),
+        ("/GO:9999999", 404),
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{base}{suffix}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            status
+        );
+    }
+    let doc = get(format!("{url}/openapi.json")).await;
+    assert_eq!(
+        doc["paths"]["/results/{result_id}/enrichment/terms"]["get"]["operationId"],
+        "get_enrichment_terms"
+    );
+    assert_eq!(calls.lock().unwrap().len(), 2); // No upstream inspection calls.
+    task.abort();
+    let (url, task) = serve(router(expired_app)).await;
+    for suffix in ["", "/GO:0000001", "/GO:0000001/proteins"] {
+        let response = client
+            .get(format!("{url}/results/{id}/enrichment/terms{suffix}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "result_not_found"
+        );
+    }
+    task.abort();
 }

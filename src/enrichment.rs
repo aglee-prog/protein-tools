@@ -131,6 +131,160 @@ pub struct EnrichmentResponse {
     /// At most ten terms, sorted by FDR, p-value, then GO ID; may be nonsignificant.
     pub top_terms: Vec<TopTerm>,
 }
+pub const MAX_ENRICHMENT_TERMS: usize = 50;
+pub const MAX_DIRECT_ENRICHMENT_BYTES: usize = 32 * 1024;
+
+pub fn is_enrichment(value: &serde_json::Value) -> bool {
+    value.get("source").and_then(|v| v.as_str()) == Some("go_bp")
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TermPageQuery {
+    #[serde(default = "default_term_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub offset: usize,
+}
+fn default_term_limit() -> usize {
+    20
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct TermStatistics {
+    pub id: String,
+    pub name: String,
+    pub hit_count: usize,
+    pub input_count: usize,
+    pub background_hit_count: usize,
+    pub background_count: usize,
+    pub p_value: f64,
+    pub fdr: f64,
+}
+impl From<&EnrichmentTerm> for TermStatistics {
+    fn from(t: &EnrichmentTerm) -> Self {
+        Self {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            hit_count: t.hit_count,
+            input_count: t.input_count,
+            background_hit_count: t.background_hit_count,
+            background_count: t.background_count,
+            p_value: t.p_value,
+            fdr: t.fdr,
+        }
+    }
+}
+#[derive(Serialize, ToSchema)]
+pub struct EnrichmentTermPage {
+    pub result_id: String,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
+    pub items: Vec<TermStatistics>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct EnrichmentTermDetail {
+    pub result_id: String,
+    pub organism_taxon: u64,
+    pub method: String,
+    pub source: String,
+    pub background: String,
+    pub uniprot_release: String,
+    pub term: TermStatistics,
+}
+#[derive(Serialize, ToSchema)]
+pub struct EnrichmentTermProteins {
+    pub result_id: String,
+    pub term_id: String,
+    /// Distinct canonical input hits; aliases do not increase this count.
+    pub hit_count: usize,
+    pub proteins: Vec<String>,
+    /// Original input order, including aliases and repeated inputs.
+    pub identifier_mapping: Vec<IdentifierMapping>,
+}
+impl App {
+    pub async fn enrichment_result(&self, id: &str) -> Result<EnrichmentResult, Error> {
+        if !valid_result_id(id) {
+            return Err(bad("invalid result_id"));
+        }
+        let value = self
+            .cache
+            .get_analysis::<serde_json::Value>(id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                failure(
+                    StatusCode::NOT_FOUND,
+                    "result_not_found",
+                    "result_id not found or expired",
+                    vec![],
+                )
+            })?;
+        if !is_enrichment(&value) {
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "wrong_result_type",
+                "result_id is not a GO BP enrichment result",
+                vec![],
+            ));
+        }
+        serde_json::from_value(value).map_err(|e| internal(e.to_string()))
+    }
+}
+impl EnrichmentResult {
+    pub fn selected_term(&self, id: &str) -> Result<&EnrichmentTerm, Error> {
+        if !id
+            .strip_prefix("GO:")
+            .is_some_and(|s| s.len() == 7 && s.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Err(bad(
+                "term_id must be a GO ID (GO: followed by seven digits)",
+            ));
+        }
+        self.items.iter().find(|t| t.id == id).ok_or_else(|| {
+            failure(
+                StatusCode::NOT_FOUND,
+                "term_not_found",
+                "term_id not found in this result",
+                vec![],
+            )
+        })
+    }
+    pub fn term_page(
+        &mut self,
+        id: String,
+        query: TermPageQuery,
+    ) -> Result<EnrichmentTermPage, Error> {
+        if query.limit == 0 {
+            return Err(bad("limit must be at least 1"));
+        }
+        let limit = query.limit.min(MAX_ENRICHMENT_TERMS);
+        self.items.sort_by(|a, b| {
+            a.fdr
+                .total_cmp(&b.fdr)
+                .then(a.p_value.total_cmp(&b.p_value))
+                .then(a.id.cmp(&b.id))
+        });
+        let items: Vec<_> = self
+            .items
+            .iter()
+            .skip(query.offset)
+            .take(limit)
+            .map(TermStatistics::from)
+            .collect();
+        Ok(EnrichmentTermPage {
+            result_id: id,
+            total: self.items.len(),
+            limit,
+            offset: query.offset,
+            has_more: query.offset.saturating_add(items.len()) < self.items.len(),
+            items,
+        })
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Background {
     proteome_id: String,

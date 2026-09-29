@@ -1,4 +1,7 @@
 use crate::enrichment::{EnrichmentRequest, EnrichmentResponse, valid_result_id};
+use crate::enrichment::{
+    EnrichmentTermDetail, EnrichmentTermPage, EnrichmentTermProteins, TermPageQuery, TermStatistics,
+};
 use crate::kegg_compare::{KeggCompareRequest, KeggCompareResponse};
 use crate::{
     cache::Cache,
@@ -8,7 +11,7 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, State, rejection::JsonRejection},
+    extract::{Path, Query, State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
@@ -231,7 +234,7 @@ async fn compare_kegg_pathways(
 }
 #[utoipa::path(post, path="/enrich-proteins", operation_id="enrich_proteins", request_body=EnrichmentRequest,
     responses((status=200, description="Compact GO BP overrepresentation result; complete data saved under result_id", body=EnrichmentResponse), (status=400, description="Invalid context, unresolved/ambiguous identifiers, or protein outside annotation universe"), (status=404, description="Result absent or expired"), (status=502, description="Upstream data unavailable or incomplete"), (status=500, description="Result cache or calculation failed")))]
-/// Run deterministic organism-scoped GO Biological Process enrichment before inspecting raw annotations. Supply proteins OR result_id and organism_taxon (NCBI taxonomy ID). Uses canonical entries with non-root GO BP annotations in the selected taxon's reference proteome, a one-sided hypergeometric test and Benjamini-Hochberg FDR over all background terms. Returns at most ten terms; use result_id to retrieve the complete cached result. Cold background loading requires paginated UniProt requests.
+/// Run deterministic GO BP enrichment with hypergeometric statistics and BH FDR. Supply proteins OR result_id and organism_taxon for new analyses. Returns a compact summary; full results stay behind result_id. Use get_enrichment_terms and get_enrichment_term for drill-down, then get_enrichment_term_proteins for selected hits. Do not retrieve the entire cached enrichment result. Cold background loading can take several minutes.
 async fn enrich_proteins(
     State(app): State<App>,
     request: Result<Json<EnrichmentRequest>, JsonRejection>,
@@ -244,9 +247,62 @@ async fn enrich_proteins(
     })?;
     app.enrich(request).await.map(Json)
 }
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms", operation_id="get_enrichment_terms", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("limit" = Option<usize>, Query, description="Default 20; clamped to 50; minimum 1"), ("offset" = Option<usize>, Query, description="Default 0")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermPage), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+/// Browse significant terms in a bounded, paginated list. Ordered by FDR, p-value, then GO ID; includes nonsignificant terms. Limit defaults to 20 and is capped at 50.
+async fn get_enrichment_terms(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(query): Query<TermPageQuery>,
+) -> Result<Json<EnrichmentTermPage>, crate::enrichment::Error> {
+    let mut result = app.enrichment_result(&id).await?;
+    result.term_page(id, query).map(Json)
+}
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}", operation_id="get_enrichment_term", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("term_id" = String, Path, description="GO term ID")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermDetail), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+/// Inspect statistics and small metadata for one selected GO term; no protein evidence or unrelated terms.
+async fn get_enrichment_term(
+    State(app): State<App>,
+    Path((id, term_id)): Path<(String, String)>,
+) -> Result<Json<EnrichmentTermDetail>, crate::enrichment::Error> {
+    let result = app.enrichment_result(&id).await?;
+    let term = TermStatistics::from(result.selected_term(&term_id)?);
+    Ok(Json(EnrichmentTermDetail {
+        result_id: id,
+        organism_taxon: result.organism_taxon,
+        method: result.method,
+        source: result.source,
+        background: result.background,
+        uniprot_release: result.uniprot_release,
+        term,
+    }))
+}
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}/proteins", operation_id="get_enrichment_term_proteins", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("term_id" = String, Path, description="GO term ID")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermProteins), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+/// Use only after selecting a specific term. Returns its canonical input hits and original identifier mappings, with no additional UniProt or GO requests.
+async fn get_enrichment_term_proteins(
+    State(app): State<App>,
+    Path((id, term_id)): Path<(String, String)>,
+) -> Result<Json<EnrichmentTermProteins>, crate::enrichment::Error> {
+    let result = app.enrichment_result(&id).await?;
+    let term = result.selected_term(&term_id)?;
+    let identifier_mapping = result
+        .identifier_mapping
+        .iter()
+        .filter(|m| term.proteins.contains(&m.canonical))
+        .cloned()
+        .collect();
+    Ok(Json(EnrichmentTermProteins {
+        result_id: id,
+        term_id,
+        hit_count: term.hit_count,
+        proteins: term.proteins.clone(),
+        identifier_mapping,
+    }))
+}
 #[utoipa::path(get, path="/results/{result_id}", operation_id="getCachedResult", params(("result_id" = String, Path, description="Cached result ID")),
-    responses((status=200, description="Complete cached protein or enrichment result", body=serde_json::Value), (status=400, description="Invalid ID"), (status=404, description="Missing or expired result"), (status=500, description="Cache failure")))]
-/// Retrieve a complete cached result. Results may be large; only call when full data is needed.
+    responses((status=200, description="Complete cached result, or explicit truncated metadata for enrichment exceeding 32 KiB", body=serde_json::Value), (status=400, description="Invalid ID"), (status=404, description="Missing or expired result"), (status=500, description="Cache failure")))]
+/// Retrieve cached data. Enrichment over 32 KiB returns truncated metadata only. Use selective enrichment tools for enrichment inspection.
 async fn cached_result(
     State(app): State<App>,
     Path(id): Path<String>,
@@ -254,15 +310,28 @@ async fn cached_result(
     if !valid_result_id(&id) {
         return Err((StatusCode::BAD_REQUEST, "invalid result_id".into()));
     }
-    app.cache
+    let value: serde_json::Value = app
+        .cache
         .get_analysis(&id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-        .map(Json)
         .ok_or((
             StatusCode::NOT_FOUND,
             "result_id not found or expired".into(),
-        ))
+        ))?;
+    if crate::enrichment::is_enrichment(&value)
+        && serde_json::to_vec(&value)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .len()
+            > crate::enrichment::MAX_DIRECT_ENRICHMENT_BYTES
+    {
+        return Ok(Json(
+            serde_json::json!({"result_id": id, "type": "go_bp_enrichment",
+            "item_count": value["items"].as_array().map_or(0, Vec::len), "truncated": true,
+            "message": "Full result withheld: exceeds 32 KiB. Use get_enrichment_terms or get_enrichment_term, then get_enrichment_term_proteins for selected input hits."}),
+        ));
+    }
+    Ok(Json(value))
 }
 #[utoipa::path(get, path="/health", operation_id="health", responses((status=200, description="Service is running; upstream reachability is not checked")))]
 async fn health() -> Json<serde_json::Value> {
@@ -276,9 +345,15 @@ async fn health() -> Json<serde_json::Value> {
         compare_kegg_pathways,
         enrich_proteins,
         cached_result,
+        get_enrichment_terms,
+        get_enrichment_term,
+        get_enrichment_term_proteins,
         health
     ),
     components(schemas(
+        EnrichmentTermPage,
+        EnrichmentTermDetail,
+        EnrichmentTermProteins,
         EnrichmentRequest,
         EnrichmentResponse,
         crate::enrichment::EnrichmentResult,
@@ -307,6 +382,18 @@ pub fn router(app: App) -> Router {
         .route("/protein-info", post(protein_info))
         .route("/enrich-proteins", post(enrich_proteins))
         .route("/results/{result_id}", get(cached_result))
+        .route(
+            "/results/{result_id}/enrichment/terms",
+            get(get_enrichment_terms),
+        )
+        .route(
+            "/results/{result_id}/enrichment/terms/{term_id}",
+            get(get_enrichment_term),
+        )
+        .route(
+            "/results/{result_id}/enrichment/terms/{term_id}/proteins",
+            get(get_enrichment_term_proteins),
+        )
         .route("/kegg-pathways", post(kegg_pathways))
         .route("/compare-kegg-pathways", post(compare_kegg_pathways))
         .route("/health", get(health))
