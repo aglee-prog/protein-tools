@@ -2,6 +2,9 @@ use crate::enrichment::{EnrichmentRequest, EnrichmentResponse, valid_result_id};
 use crate::enrichment::{
     EnrichmentTermDetail, EnrichmentTermPage, EnrichmentTermProteins, TermPageQuery, TermStatistics,
 };
+use crate::enrichment::{
+    GroupEnrichmentDetail, GroupEnrichmentRequest, GroupEnrichmentResponse, GroupSelector,
+};
 use crate::kegg_compare::{KeggCompareRequest, KeggCompareResponse};
 use crate::{
     cache::Cache,
@@ -247,25 +250,54 @@ async fn enrich_proteins(
     })?;
     app.enrich(request).await.map(Json)
 }
-#[utoipa::path(get, path="/results/{result_id}/enrichment/terms", operation_id="get_enrichment_terms", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("limit" = Option<usize>, Query, description="Default 20; clamped to 50; minimum 1"), ("offset" = Option<usize>, Query, description="Default 0")),
-    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermPage), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+#[utoipa::path(post, path="/enrich-groups", operation_id="enrich_groups", request_body=GroupEnrichmentRequest,
+    responses((status=200, description="Compact independent group summaries; check complete and failed_groups", body=GroupEnrichmentResponse), (status=400, description="Invalid request"), (status=502, description="Shared background unavailable"), (status=500, description="Cache or calculation failure")))]
+/// Enrich 1–50 groups independently using one taxon/background and shared identifier resolution. At most 5,000 total inputs. Failed groups are explicit; valid groups remain available. No cross-group statistics. Inspect selected groups using get_group_enrichment and enrichment term tools with group selector.
+async fn enrich_groups(
+    State(app): State<App>,
+    request: Result<Json<GroupEnrichmentRequest>, JsonRejection>,
+) -> Result<Json<GroupEnrichmentResponse>, crate::enrichment::Error> {
+    let Json(request) = request.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{"code":"invalid_request","message":e.body_text()}})),
+        )
+    })?;
+    app.enrich_groups(request).await.map(Json)
+}
+#[utoipa::path(get, path="/results/{result_id}/enrichment/group", operation_id="get_group_enrichment", params(("result_id" = String, Path), ("group" = String, Query, description="Exact original group name")), responses((status=200, description="Selected group summary, provenance and explicit error if failed; no term collection", body=GroupEnrichmentDetail), (status=400, description="Invalid selector or result type"), (status=404, description="Result or group absent")))]
+async fn get_group_enrichment(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    Query(query): Query<GroupSelector>,
+) -> Result<Json<GroupEnrichmentDetail>, crate::enrichment::Error> {
+    let group = query.group.ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":{"code":"invalid_request","message":"group is required"}}))))?;
+    app.group_enrichment_detail(id, group).await.map(Json)
+}
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms", operation_id="get_enrichment_terms", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("group" = Option<String>, Query, description="Exact group name; required for batch results, omitted for single-set results"), ("limit" = Option<usize>, Query, description="Default 20; clamped to 50; minimum 1"), ("offset" = Option<usize>, Query, description="Default 0")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermPage), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=422, description="Selected batch group failed; inspect get_group_enrichment for error details"), (status=500, description="Cache failure")))]
 /// Browse significant terms in a bounded, paginated list. Ordered by FDR, p-value, then GO ID; includes nonsignificant terms. Limit defaults to 20 and is capped at 50.
 async fn get_enrichment_terms(
     State(app): State<App>,
     Path(id): Path<String>,
     Query(query): Query<TermPageQuery>,
 ) -> Result<Json<EnrichmentTermPage>, crate::enrichment::Error> {
-    let mut result = app.enrichment_result(&id).await?;
+    let mut result = app
+        .selected_enrichment_result(&id, query.group.as_deref())
+        .await?;
     result.term_page(id, query).map(Json)
 }
-#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}", operation_id="get_enrichment_term", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("term_id" = String, Path, description="GO term ID")),
-    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermDetail), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}", operation_id="get_enrichment_term", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("group" = Option<String>, Query, description="Exact group name; required for batch results, omitted for single-set results"), ("term_id" = String, Path, description="GO term ID")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermDetail), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=422, description="Selected batch group failed; inspect get_group_enrichment for error details"), (status=500, description="Cache failure")))]
 /// Inspect statistics and small metadata for one selected GO term; no protein evidence or unrelated terms.
 async fn get_enrichment_term(
     State(app): State<App>,
     Path((id, term_id)): Path<(String, String)>,
+    Query(query): Query<GroupSelector>,
 ) -> Result<Json<EnrichmentTermDetail>, crate::enrichment::Error> {
-    let result = app.enrichment_result(&id).await?;
+    let result = app
+        .selected_enrichment_result(&id, query.group.as_deref())
+        .await?;
     let term = TermStatistics::from(result.selected_term(&term_id)?);
     Ok(Json(EnrichmentTermDetail {
         result_id: id,
@@ -277,14 +309,17 @@ async fn get_enrichment_term(
         term,
     }))
 }
-#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}/proteins", operation_id="get_enrichment_term_proteins", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("term_id" = String, Path, description="GO term ID")),
-    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermProteins), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=500, description="Cache failure")))]
+#[utoipa::path(get, path="/results/{result_id}/enrichment/terms/{term_id}/proteins", operation_id="get_enrichment_term_proteins", params(("result_id" = String, Path, description="Cached enrichment result ID"), ("group" = Option<String>, Query, description="Exact group name; required for batch results, omitted for single-set results"), ("term_id" = String, Path, description="GO term ID")),
+    responses((status=200, description="Selective cached enrichment inspection", body=EnrichmentTermProteins), (status=400, description="Invalid input or wrong result type"), (status=404, description="Result expired, absent, or term absent"), (status=422, description="Selected batch group failed; inspect get_group_enrichment for error details"), (status=500, description="Cache failure")))]
 /// Use only after selecting a specific term. Returns its canonical input hits and original identifier mappings, with no additional UniProt or GO requests.
 async fn get_enrichment_term_proteins(
     State(app): State<App>,
     Path((id, term_id)): Path<(String, String)>,
+    Query(query): Query<GroupSelector>,
 ) -> Result<Json<EnrichmentTermProteins>, crate::enrichment::Error> {
-    let result = app.enrichment_result(&id).await?;
+    let result = app
+        .selected_enrichment_result(&id, query.group.as_deref())
+        .await?;
     let term = result.selected_term(&term_id)?;
     let identifier_mapping = result
         .identifier_mapping
@@ -325,6 +360,13 @@ async fn cached_result(
             .len()
             > crate::enrichment::MAX_DIRECT_ENRICHMENT_BYTES
     {
+        if value["type"] == "group_enrichment" {
+            return Ok(Json(serde_json::json!({
+                "result_id": id, "type": "group_enrichment", "truncated": true,
+                "group_count": value["groups"].as_object().map_or(0, |g| g.len()),
+                "message": "Full result withheld: exceeds 32 KiB. Use get_group_enrichment or get_enrichment_terms / get_enrichment_term / get_enrichment_term_proteins with a group query selector."
+            })));
+        }
         return Ok(Json(
             serde_json::json!({"result_id": id, "type": "go_bp_enrichment",
             "item_count": value["items"].as_array().map_or(0, Vec::len), "truncated": true,
@@ -344,6 +386,8 @@ async fn health() -> Json<serde_json::Value> {
         kegg_pathways,
         compare_kegg_pathways,
         enrich_proteins,
+        enrich_groups,
+        get_group_enrichment,
         cached_result,
         get_enrichment_terms,
         get_enrichment_term,
@@ -354,6 +398,9 @@ async fn health() -> Json<serde_json::Value> {
         EnrichmentTermPage,
         EnrichmentTermDetail,
         EnrichmentTermProteins,
+        GroupEnrichmentRequest,
+        GroupEnrichmentResponse,
+        GroupEnrichmentDetail,
         EnrichmentRequest,
         EnrichmentResponse,
         crate::enrichment::EnrichmentResult,
@@ -381,6 +428,11 @@ pub fn router(app: App) -> Router {
     Router::new()
         .route("/protein-info", post(protein_info))
         .route("/enrich-proteins", post(enrich_proteins))
+        .route("/enrich-groups", post(enrich_groups))
+        .route(
+            "/results/{result_id}/enrichment/group",
+            get(get_group_enrichment),
+        )
         .route("/results/{result_id}", get(cached_result))
         .route(
             "/results/{result_id}/enrichment/terms",

@@ -141,6 +141,7 @@ pub fn is_enrichment(value: &serde_json::Value) -> bool {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TermPageQuery {
+    pub group: Option<String>,
     #[serde(default = "default_term_limit")]
     pub limit: usize,
     #[serde(default)]
@@ -206,6 +207,13 @@ pub struct EnrichmentTermProteins {
 }
 impl App {
     pub async fn enrichment_result(&self, id: &str) -> Result<EnrichmentResult, Error> {
+        self.selected_enrichment_result(id, None).await
+    }
+    pub async fn selected_enrichment_result(
+        &self,
+        id: &str,
+        group: Option<&str>,
+    ) -> Result<EnrichmentResult, Error> {
         if !valid_result_id(id) {
             return Err(bad("invalid result_id"));
         }
@@ -229,6 +237,28 @@ impl App {
                 "result_id is not a GO BP enrichment result",
                 vec![],
             ));
+        }
+        if value["type"] == "group_enrichment" {
+            let group = group.ok_or_else(|| bad("group is required for a batch result"))?;
+            let mut batch: GroupEnrichmentResult =
+                serde_json::from_value(value).map_err(|e| internal(e.to_string()))?;
+            let selected = batch.groups.remove(group).ok_or_else(|| {
+                failure(
+                    StatusCode::NOT_FOUND,
+                    "group_not_found",
+                    "group not found",
+                    vec![],
+                )
+            })?;
+            return selected.result.ok_or_else(|| {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    axum::Json(serde_json::json!({"error": selected.error})),
+                )
+            });
+        }
+        if group.is_some() {
+            return Err(bad("group selector requires a batch enrichment result"));
         }
         serde_json::from_value(value).map_err(|e| internal(e.to_string()))
     }
@@ -732,68 +762,8 @@ impl App {
         let queries: BTreeSet<_> = proteins.iter().map(|p| normalize(p, None).0).collect();
         // Taxon-scoped cache namespace avoids stale name/alias resolution from v1.
         // Both enrichment and lookup use the same resolver and ranking policy.
-        let resolved: Vec<_> = stream::iter(queries.into_iter().map(|query| async move {
-            let outcome = async {
-                let _permit = self
-                    .permits
-                    .acquire()
-                    .await
-                    .map_err(|_| "server shutting down".to_owned())?;
-                let key = (query.clone(), format!("taxon:{taxon}:resolver_v2"));
-                let protein = match self.cache.get(key.clone()).await? {
-                    Some(protein) => Some(protein),
-                    None => {
-                        let protein = self.upstream.resolve_taxon(&query, taxon).await?;
-                        if let Some(protein) = &protein {
-                            self.cache.put(key, protein.clone()).await?;
-                        }
-                        protein
-                    }
-                };
-                Ok::<_, String>(protein.filter(|p| p.found).and_then(|p| p.uniprot_id))
-            }
-            .await;
-            (query, outcome)
-        }))
-        .buffered(MAX_CONCURRENT_LOOKUPS)
-        .collect()
-        .await;
-        let mut canonical = BTreeMap::new();
-        let mut issues = vec![];
-        let mut upstream_failed = false;
-        for (identifier, outcome) in resolved {
-            match outcome {
-                Ok(Some(id)) => {
-                    canonical.insert(identifier, id);
-                }
-                Ok(None) => {
-                    issues.push(serde_json::json!({"identifier":identifier,"reason":"unresolved"}))
-                }
-                Err(message) => {
-                    let reason = if message.contains("ambiguous")
-                        || message.contains("candidate set too large")
-                    {
-                        "ambiguous"
-                    } else {
-                        upstream_failed = true;
-                        "upstream_error"
-                    };
-                    issues.push(serde_json::json!({"identifier":identifier,"reason":reason,"message":message}));
-                }
-            }
-        }
-        if !issues.is_empty() {
-            return Err((
-                if upstream_failed {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    StatusCode::BAD_REQUEST
-                },
-                axum::Json(serde_json::json!({"error":{
-                    "code":"resolution_failed", "organism_taxon":taxon, "message":"Every identifier must resolve; no analysis performed", "identifiers":issues
-                }})),
-            ));
-        }
+        let resolved = self.resolve_enrichment(queries, taxon).await;
+        let canonical = checked_resolution(resolved, taxon)?;
         let mapping = saved_mapping.unwrap_or_else(|| {
             proteins
                 .iter()
@@ -804,44 +774,11 @@ impl App {
                 .collect()
         });
         let proteins: BTreeSet<_> = canonical.into_values().collect();
-        let snapshot_key = format!("go_bp_proteome_taxon_{taxon}_v2");
-        let background = match self
-            .cache
-            .get_analysis::<Background>(&snapshot_key)
-            .await
-            .map_err(internal)?
-        {
-            Some(background) => background,
-            None => {
-                let _permit = self
-                    .permits
-                    .acquire()
-                    .await
-                    .map_err(|_| internal("server shutting down".into()))?;
-                let background = self.upstream.go_background(taxon).await.map_err(upstream)?;
-                self.cache
-                    .put_analysis(Some(snapshot_key), background.clone())
-                    .await
-                    .map_err(internal)?;
-                background
-            }
-        };
-        let eligible = background.eligible();
-        let outside: Vec<_> = proteins.difference(&eligible).cloned().collect();
-        if !outside.is_empty() {
-            return Err(failure(
-                StatusCode::BAD_REQUEST,
-                "outside_annotation_universe",
-                "proteins outside the selected taxon's proteome or without non-root GO BP annotations; no analysis performed",
-                outside,
-            ));
-        }
-        let mut result = tokio::task::spawn_blocking(move || calculate(&background, proteins))
-            .await
-            .map_err(|e| internal(e.to_string()))?
-            .map_err(internal)?;
-        result.input_identifiers = mapping.iter().map(|m| m.input.clone()).collect();
-        result.identifier_mapping = mapping;
+        let background = self.enrichment_background(taxon).await?;
+        let result =
+            tokio::task::spawn_blocking(move || calculate_resolved(&background, proteins, mapping))
+                .await
+                .map_err(|e| internal(e.to_string()))??;
         let response = EnrichmentResponse {
             organism_taxon: taxon,
             result_id: String::new(),
@@ -997,5 +934,416 @@ mod tests {
         bg.add_page("Entry\tReviewed\tGeneID\tGene Ontology (biological process)\nP00001\treviewed\t\troot [GO:0008150]; test [GO:0000001]; test [GO:0000001]\n").unwrap();
         assert_eq!(bg.terms.len(), 1);
         assert_eq!(bg.terms["GO:0000001"].proteins.len(), 1);
+    }
+}
+
+impl App {
+    async fn resolve_enrichment(
+        &self,
+        queries: BTreeSet<String>,
+        taxon: u64,
+    ) -> Vec<(String, Result<Option<String>, String>)> {
+        stream::iter(queries.into_iter().map(|query| async move {
+            let outcome = async {
+                let _permit = self
+                    .permits
+                    .acquire()
+                    .await
+                    .map_err(|_| "server shutting down".to_owned())?;
+                let key = (query.clone(), format!("taxon:{taxon}:resolver_v2"));
+                let protein = match self.cache.get(key.clone()).await? {
+                    Some(protein) => Some(protein),
+                    None => {
+                        let protein = self.upstream.resolve_taxon(&query, taxon).await?;
+                        if let Some(protein) = &protein {
+                            self.cache.put(key, protein.clone()).await?;
+                        }
+                        protein
+                    }
+                };
+                Ok::<_, String>(protein.filter(|p| p.found).and_then(|p| p.uniprot_id))
+            }
+            .await;
+            (query, outcome)
+        }))
+        .buffered(MAX_CONCURRENT_LOOKUPS)
+        .collect()
+        .await
+    }
+    async fn enrichment_background(&self, taxon: u64) -> Result<Background, Error> {
+        let snapshot_key = format!("go_bp_proteome_taxon_{taxon}_v2");
+        let background = match self
+            .cache
+            .get_analysis::<Background>(&snapshot_key)
+            .await
+            .map_err(internal)?
+        {
+            Some(background) => background,
+            None => {
+                let _permit = self
+                    .permits
+                    .acquire()
+                    .await
+                    .map_err(|_| internal("server shutting down".into()))?;
+                let background = self.upstream.go_background(taxon).await.map_err(upstream)?;
+                self.cache
+                    .put_analysis(Some(snapshot_key), background.clone())
+                    .await
+                    .map_err(internal)?;
+                background
+            }
+        };
+        Ok(background)
+    }
+}
+fn checked_resolution(
+    resolved: Vec<(String, Result<Option<String>, String>)>,
+    taxon: u64,
+) -> Result<BTreeMap<String, String>, Error> {
+    let mut canonical = BTreeMap::new();
+    let mut issues = vec![];
+    let mut upstream_failed = false;
+    for (identifier, outcome) in resolved {
+        match outcome {
+            Ok(Some(id)) => {
+                canonical.insert(identifier, id);
+            }
+            Ok(None) => {
+                issues.push(serde_json::json!({"identifier":identifier,"reason":"unresolved"}))
+            }
+            Err(message) => {
+                let reason = if message.contains("ambiguous")
+                    || message.contains("candidate set too large")
+                {
+                    "ambiguous"
+                } else {
+                    upstream_failed = true;
+                    "upstream_error"
+                };
+                issues.push(
+                    serde_json::json!({"identifier":identifier,"reason":reason,"message":message}),
+                );
+            }
+        }
+    }
+    if !issues.is_empty() {
+        return Err((
+            if upstream_failed {
+                StatusCode::BAD_GATEWAY
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            axum::Json(serde_json::json!({"error":{
+                "code":"resolution_failed", "organism_taxon":taxon, "message":"Every identifier must resolve; no analysis performed", "identifiers":issues
+            }})),
+        ));
+    }
+    Ok(canonical)
+}
+fn calculate_resolved(
+    background: &Background,
+    proteins: BTreeSet<String>,
+    mapping: Vec<IdentifierMapping>,
+) -> Result<EnrichmentResult, Error> {
+    let outside: Vec<_> = proteins
+        .difference(&background.eligible())
+        .cloned()
+        .collect();
+    if !outside.is_empty() {
+        return Err(failure(
+            StatusCode::BAD_REQUEST,
+            "outside_annotation_universe",
+            "proteins outside the selected taxon's proteome or without non-root GO BP annotations; no analysis performed",
+            outside,
+        ));
+    }
+    let mut result = calculate(background, proteins).map_err(internal)?;
+    result.input_identifiers = mapping.iter().map(|m| m.input.clone()).collect();
+    result.identifier_mapping = mapping;
+    Ok(result)
+}
+
+pub const MAX_ENRICHMENT_GROUPS: usize = 50;
+pub const MAX_GROUP_IDENTIFIERS: usize = 5000;
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GroupEnrichmentRequest {
+    /// 1–50 named groups, each 1–500 identifiers; at most 5,000 identifiers total.
+    /// Names are preserved exactly (1–128 bytes, no control characters).
+    pub groups: BTreeMap<String, Vec<String>>,
+    pub organism_taxon: u64,
+    pub source: Option<String>,
+    pub background: Option<String>,
+}
+#[derive(Deserialize, Serialize, ToSchema)]
+pub struct GroupEnrichmentResult {
+    pub r#type: String,
+    pub organism_taxon: u64,
+    pub source: String,
+    pub background: String,
+    pub fdr_threshold: f64,
+    pub groups: BTreeMap<String, GroupOutcome>,
+}
+#[derive(Deserialize, Serialize, ToSchema)]
+pub struct GroupOutcome {
+    pub input_identifiers: Vec<String>,
+    pub status: String,
+    pub error: Option<serde_json::Value>,
+    pub result: Option<EnrichmentResult>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct GroupSummary {
+    pub group: String,
+    pub status: String,
+    pub original_input_count: usize,
+    pub input_count: Option<usize>,
+    pub significant_terms: Option<usize>,
+    pub error_code: Option<String>,
+}
+impl GroupOutcome {
+    fn summary(&self, group: String) -> GroupSummary {
+        GroupSummary {
+            group,
+            status: self.status.clone(),
+            original_input_count: self.input_identifiers.len(),
+            input_count: self.result.as_ref().map(|r| r.input_count),
+            significant_terms: self
+                .result
+                .as_ref()
+                .map(|r| r.items.iter().filter(|t| t.fdr <= FDR_THRESHOLD).count()),
+            error_code: self
+                .error
+                .as_ref()
+                .and_then(|e| e["code"].as_str())
+                .map(String::from),
+        }
+    }
+}
+#[derive(Serialize, ToSchema)]
+pub struct GroupEnrichmentResponse {
+    pub result_id: String,
+    pub organism_taxon: u64,
+    pub source: String,
+    pub background: String,
+    pub fdr_threshold: f64,
+    pub groups: usize,
+    pub successful_groups: usize,
+    pub failed_groups: usize,
+    pub complete: bool,
+    pub summary: Vec<GroupSummary>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupSelector {
+    pub group: Option<String>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct GroupEnrichmentDetail {
+    pub result_id: String,
+    pub organism_taxon: u64,
+    pub source: String,
+    pub background: String,
+    pub fdr_threshold: f64,
+    pub summary: GroupSummary,
+    pub input_identifiers: Vec<String>,
+    pub identifier_mapping: Vec<IdentifierMapping>,
+    pub error: Option<serde_json::Value>,
+    pub background_count: Option<usize>,
+    pub tested_terms: Option<usize>,
+    pub proteome_id: Option<String>,
+    pub uniprot_release: Option<String>,
+}
+fn validate_group(name: &str, proteins: &[String]) -> Result<(), Error> {
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(bad(
+            "group names must contain 1–128 bytes without control characters",
+        ));
+    }
+    if proteins.is_empty()
+        || proteins.len() > MAX_REQUEST_PROTEINS
+        || proteins
+            .iter()
+            .any(|p| p.trim().is_empty() || p.len() > 128 || p.chars().any(char::is_control))
+    {
+        return Err(bad("proteins must contain 1 to 500 valid identifiers"));
+    }
+    Ok(())
+}
+impl App {
+    pub async fn enrich_groups(
+        &self,
+        request: GroupEnrichmentRequest,
+    ) -> Result<GroupEnrichmentResponse, Error> {
+        if request.groups.is_empty()
+            || request.groups.len() > MAX_ENRICHMENT_GROUPS
+            || request.groups.values().map(Vec::len).sum::<usize>() > MAX_GROUP_IDENTIFIERS
+        {
+            return Err(bad(
+                "supply 1–50 groups and at most 5,000 total identifiers",
+            ));
+        }
+        if request.organism_taxon == 0
+            || request.source.as_deref().is_some_and(|s| s != "go_bp")
+            || request
+                .background
+                .as_deref()
+                .is_some_and(|s| s != "proteome")
+        {
+            return Err(bad(
+                "positive organism_taxon, source=go_bp and background=proteome are required",
+            ));
+        }
+        let taxon = request.organism_taxon;
+        let queries = request
+            .groups
+            .iter()
+            .filter(|(name, proteins)| validate_group(name, proteins).is_ok())
+            .flat_map(|(_, proteins)| proteins.iter().map(|p| normalize(p, None).0))
+            .collect();
+        let resolved: BTreeMap<_, _> = self
+            .resolve_enrichment(queries, taxon)
+            .await
+            .into_iter()
+            .collect();
+        // One snapshot for every group; never calculate against incomplete shared context.
+        let background = self.enrichment_background(taxon).await?;
+        let batch = tokio::task::spawn_blocking(move || {
+            let mut groups = BTreeMap::new();
+            for (name, inputs) in request.groups {
+                let outcome = (|| {
+                    validate_group(&name, &inputs)?;
+                    let queries: BTreeSet<_> =
+                        inputs.iter().map(|p| normalize(p, None).0).collect();
+                    let canonical = checked_resolution(
+                        queries
+                            .into_iter()
+                            .map(|q| {
+                                let r = resolved[&q].clone();
+                                (q, r)
+                            })
+                            .collect(),
+                        taxon,
+                    )?;
+                    let mapping = inputs
+                        .iter()
+                        .map(|p| IdentifierMapping {
+                            input: p.clone(),
+                            canonical: canonical[&normalize(p, None).0].clone(),
+                        })
+                        .collect();
+                    calculate_resolved(&background, canonical.into_values().collect(), mapping)
+                })();
+                let (result, error) = match outcome {
+                    Ok(result) => (Some(result), None),
+                    Err((status, axum::Json(mut body))) => {
+                        body["error"]["http_status"] = serde_json::json!(status.as_u16());
+                        (None, Some(body["error"].take()))
+                    }
+                };
+                groups.insert(
+                    name,
+                    GroupOutcome {
+                        input_identifiers: inputs,
+                        status: if result.is_some() {
+                            "success"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
+                        error,
+                        result,
+                    },
+                );
+            }
+            GroupEnrichmentResult {
+                r#type: "group_enrichment".into(),
+                organism_taxon: taxon,
+                source: "go_bp".into(),
+                background: "proteome".into(),
+                fdr_threshold: FDR_THRESHOLD,
+                groups,
+            }
+        })
+        .await
+        .map_err(|e| internal(e.to_string()))?;
+        let summary: Vec<_> = batch
+            .groups
+            .iter()
+            .map(|(name, outcome)| outcome.summary(name.clone()))
+            .collect();
+        let successful_groups = summary.iter().filter(|s| s.status == "success").count();
+        let groups = summary.len();
+        let result_id = self
+            .cache
+            .put_analysis(None, batch)
+            .await
+            .map_err(internal)?;
+        Ok(GroupEnrichmentResponse {
+            result_id,
+            organism_taxon: taxon,
+            source: "go_bp".into(),
+            background: "proteome".into(),
+            fdr_threshold: FDR_THRESHOLD,
+            groups,
+            successful_groups,
+            failed_groups: groups - successful_groups,
+            complete: groups == successful_groups,
+            summary,
+        })
+    }
+    pub async fn group_enrichment_detail(
+        &self,
+        id: String,
+        group: String,
+    ) -> Result<GroupEnrichmentDetail, Error> {
+        if !valid_result_id(&id) {
+            return Err(bad("invalid result_id"));
+        }
+        let value: serde_json::Value = self
+            .cache
+            .get_analysis(&id)
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| {
+                failure(
+                    StatusCode::NOT_FOUND,
+                    "result_not_found",
+                    "result_id not found or expired",
+                    vec![],
+                )
+            })?;
+        if value["type"] != "group_enrichment" {
+            return Err(bad("result_id is not a group enrichment result"));
+        }
+        let mut batch: GroupEnrichmentResult =
+            serde_json::from_value(value).map_err(|e| internal(e.to_string()))?;
+        let outcome = batch.groups.remove(&group).ok_or_else(|| {
+            failure(
+                StatusCode::NOT_FOUND,
+                "group_not_found",
+                "group not found",
+                vec![],
+            )
+        })?;
+        let summary = outcome.summary(group);
+        let r = outcome.result;
+        Ok(GroupEnrichmentDetail {
+            result_id: id,
+            organism_taxon: batch.organism_taxon,
+            source: batch.source,
+            background: batch.background,
+            fdr_threshold: batch.fdr_threshold,
+            summary,
+            input_identifiers: outcome.input_identifiers,
+            identifier_mapping: r
+                .as_ref()
+                .map(|r| r.identifier_mapping.clone())
+                .unwrap_or_default(),
+            error: outcome.error,
+            background_count: r.as_ref().map(|r| r.background_count),
+            tested_terms: r.as_ref().map(|r| r.tested_terms),
+            proteome_id: r.as_ref().map(|r| r.universe.proteome_id.clone()),
+            uniprot_release: r.map(|r| r.uniprot_release),
+        })
     }
 }

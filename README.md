@@ -409,3 +409,88 @@ References: [UniProt API queries](https://www.uniprot.org/help/api_queries),
 [UniProt return fields](https://www.uniprot.org/help/return_fields),
 [UniProt proteomes](https://www.uniprot.org/help/proteome), and
 [statrs Hypergeometric](https://docs.rs/statrs/0.18.0/statrs/distribution/struct.Hypergeometric.html).
+
+## Batch GO Biological Process enrichment
+
+Use **`enrich_groups`** (`POST /enrich-groups`) when a table contains multiple
+modules or UP/DOWN arms. The caller determines the groups; one request analyzes
+each group independently with the existing Stage 1 calculation. Proteins are
+never pooled, and BH correction is performed separately for each group over the
+same complete background term universe. No cross-group statistics are computed.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8091/enrich-groups \
+  -H 'Content-Type: application/json' \
+  -d '{"organism_taxon":10090,"source":"go_bp","groups":{
+    "Module 1":["P02340","Atm","Atr"],
+    "Module 7 UP":["Brca1","Brca2","P02340"],
+    "Module 7 DOWN":["Akt1","Egfr","P02340"]
+  }}'
+```
+
+The example uses the canonical mouse p53 accession `P02340`: `Trp53` can
+resolve ambiguously under the existing exact-symbol policy. Ambiguous symbols
+require a more precise identifier; the batch never guesses.
+
+Supply 1–50 groups, at most 500 identifiers per group and 5,000 total identifier
+occurrences (including duplicates). Names retain exact spelling and whitespace;
+names must contain 1–128 UTF-8 bytes without control characters. Identifier
+validation, normalization, alias resolution, annotation eligibility, statistics,
+and defaults (`source=go_bp`, `background=proteome`) match `enrich_proteins`.
+A positive `organism_taxon` is required for the entire batch. Normalized shared
+identifiers, including unsuccessful resolutions, are resolved once per request.
+One complete organism-specific background snapshot is loaded and reused.
+
+The response contains one `result_id`, taxon/source/background, `fdr_threshold`,
+`groups` (count), `successful_groups`, `failed_groups`, `complete`, and `summary`.
+Each summary contains the exact `group` name, `status`, `original_input_count`,
+canonical distinct `input_count`, `significant_terms`, and `error_code`.
+Failed groups have null analysis counts. No terms or protein lists are returned
+in this initial summary; its size does not grow with the number of GO terms.
+
+**Check `complete` and `failed_groups` before interpreting a batch.** Empty groups,
+invalid group names/identifiers, unresolved or ambiguous identifiers, resolution
+upstream errors, and unannotated/out-of-proteome proteins explicitly fail the
+affected group. Other valid groups remain available. HTTP 200 can therefore
+represent partial completion or even all groups failing. Batch size violations,
+invalid shared parameters, malformed JSON, shared background failures, and result
+storage failures fail the entire request (400, 502, or 500 as appropriate).
+No unresolved protein is silently removed from a successful group's analysis.
+
+Inspect only what is relevant:
+
+- **`get_group_enrichment`**:
+  `GET /results/{result_id}/enrichment/group?group=Module%207%20UP`
+  returns one group's summary, original identifiers, canonical mappings,
+  background counts/proteome/release, and structured error if it failed.
+  It includes no term collection or background accession list.
+- Reuse **`get_enrichment_terms`** with `group`, `limit`, and `offset`:
+  `GET /results/{result_id}/enrichment/terms?group=Module%207%20UP&limit=20&offset=0`.
+  The existing ordering, default 20, maximum 50, and pagination metadata apply.
+- The existing **`get_enrichment_term`** and **`get_enrichment_term_proteins`**
+  accept the same `group` query selector for one term's details or input hits.
+
+URL-encode group names exactly, including `/`, `+`, Unicode, or surrounding
+spaces; query parameters support names that would be awkward in a URL path.
+The selector is required for batch term reads and rejected for single-set reads.
+Absent groups return 404. Term inspection of a failed group returns 422 with its
+saved structured error; group-summary inspection returns 200 with `status=failed`.
+Reads use saved statistics and perform no upstream lookups or recalculation.
+
+The existing SQLite analysis cache and TTL store one `type=group_enrichment`
+result containing each group's original inputs, status/error, and complete
+Stage 1 result (canonical mappings, parameters, background provenance and terms).
+Generic `getCachedResult` applies the same **32 KiB** safeguard to batches and
+returns `truncated=true`, `type=group_enrichment`, and `group_count` for oversized
+results. Full batch terms are available only through selective reads in that
+case. Single-set enrichment and its default response remain unchanged.
+
+Run the opt-in live mouse check with:
+
+```sh
+cargo test --test enrichment live_mouse_group_enrichment -- --ignored --nocapture
+```
+
+It downloads the real mouse background, runs three overlapping groups, verifies
+shared context and compact responses, and exercises selective reads and generic
+result protection. The regular test suite uses small synthetic upstream fixtures.

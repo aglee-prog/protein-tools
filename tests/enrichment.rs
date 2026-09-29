@@ -951,3 +951,379 @@ async fn selective_inspection_limits_membership_errors_and_restart() {
     }
     task.abort();
 }
+
+#[tokio::test]
+async fn groups_independent_partial_persistent_and_selective() {
+    let (app, calls, dir, upstream_task) = setup("").await;
+    let original = app.clone();
+    let (url, task) = serve(router(app.clone())).await;
+    let client = reqwest::Client::new();
+    let name = " Module / 7 + UP α ";
+    let inputs = json!([
+        "P00000", "P00001", "P00002", "P00003", "P00004", "GENE0", " p00000 "
+    ]);
+    let response = client.post(format!("{url}/enrich-groups")).json(&json!({
+        "organism_taxon":9606,"groups":{name:inputs,"DOWN":["P00000","P00008"],"empty":[],"unannotated":["P00019"]}
+    })).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let compact: Value = response.json().await.unwrap();
+    assert_eq!(compact["groups"], 4);
+    assert_eq!(compact["successful_groups"], 2);
+    assert_eq!(compact["failed_groups"], 2);
+    assert_eq!(compact["complete"], false);
+    assert!(!compact.to_string().contains("GO:"));
+    let summary = compact["summary"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["group"] == name)
+        .unwrap();
+    assert_eq!(summary["input_count"], 5);
+    assert_eq!(summary["significant_terms"], 12);
+    let id = compact["result_id"].as_str().unwrap();
+    let full: Value = app.cache.get_analysis(id).await.unwrap().unwrap();
+    assert_eq!(full["type"], "group_enrichment");
+    let up = &full["groups"][name]["result"];
+    let down = &full["groups"]["DOWN"]["result"];
+    assert_eq!(up["input_identifiers"], inputs);
+    assert_eq!(up["identifier_mapping"].as_array().unwrap().len(), 7);
+    assert_eq!(down["input_count"], 2);
+    assert_ne!(up["items"][0]["p_value"], down["items"][0]["p_value"]);
+    assert_eq!(up["universe"], down["universe"]);
+    assert_eq!(up["organism_taxon"], down["organism_taxon"]);
+    assert_eq!(calls.lock().unwrap().len(), 2); // one two-page background
+    assert_eq!(full["groups"]["empty"]["error"]["code"], "invalid_request");
+    assert_eq!(
+        full["groups"]["unannotated"]["error"]["code"],
+        "outside_annotation_universe"
+    );
+    // Exact parity with existing single-set endpoint, including all zero-hit tests and BH FDR.
+    let single: Value = client
+        .post(format!("{url}/enrich-proteins"))
+        .json(&json!({"organism_taxon":9606,"proteins":inputs}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let saved: Value = app
+        .cache
+        .get_analysis(single["result_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*up, saved);
+    task.abort();
+    upstream_task.abort();
+    let mut restarted = original;
+    restarted.cache = Cache::open(dir.path().join("cache.sqlite").to_str().unwrap(), 30).unwrap();
+    let (url, task) = serve(router(restarted.clone())).await;
+    let detail: Value = client
+        .get(format!("{url}/results/{id}/enrichment/group"))
+        .query(&[("group", name)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["summary"]["group"], name);
+    assert_eq!(detail["input_identifiers"], inputs);
+    assert!(detail.get("items").is_none());
+    assert!(detail.get("groups").is_none());
+    let first: Value = client
+        .get(format!("{url}/results/{id}/enrichment/terms"))
+        .query(&[("group", name), ("limit", "2")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(first["total"], 13);
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["items"].as_array().unwrap().len(), 2);
+    assert!(first["items"][0].get("proteins").is_none());
+    let next: Value = client
+        .get(format!("{url}/results/{id}/enrichment/terms"))
+        .query(&[("group", name), ("limit", "999"), ("offset", "2")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(next["limit"], 50);
+    assert_eq!(next["has_more"], false);
+    assert_eq!(next["items"][0]["id"], up["items"][2]["id"]);
+    for suffix in ["", "/proteins"] {
+        let selected: Value = client
+            .get(format!(
+                "{url}/results/{id}/enrichment/terms/GO:0000001{suffix}"
+            ))
+            .query(&[("group", name)])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if suffix.is_empty() {
+            assert_eq!(selected["term"]["hit_count"], 5);
+        } else {
+            assert_eq!(selected["identifier_mapping"].as_array().unwrap().len(), 7);
+        }
+    }
+    for (query, status) in [
+        (vec![], StatusCode::BAD_REQUEST),
+        (vec![("group", "absent")], StatusCode::NOT_FOUND),
+        (vec![("group", "empty")], StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            vec![("group", name), ("limit", "0")],
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            client
+                .get(format!("{url}/results/{id}/enrichment/terms"))
+                .query(&query)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            status
+        );
+    }
+    let failed: Value = client
+        .get(format!("{url}/results/{id}/enrichment/group"))
+        .query(&[("group", "empty")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(failed["summary"]["status"], "failed");
+    assert_eq!(failed["error"]["code"], "invalid_request");
+    // Expand a real saved batch beyond the safety threshold; no complete group is leaked.
+    let mut oversized = full;
+    oversized["groups"][name]["result"]["items"][0]["name"] = json!("x".repeat(40_000));
+    let large_id = restarted.cache.put_analysis(None, oversized).await.unwrap();
+    let protected: Value = client
+        .get(format!("{url}/results/{large_id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(protected["truncated"], true);
+    assert_eq!(protected["type"], "group_enrichment");
+    assert_eq!(protected["group_count"], 4);
+    assert!(protected.get("groups").is_none());
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    task.abort();
+}
+
+#[tokio::test]
+async fn groups_share_uncached_resolution_including_failures_and_mouse_context() {
+    let (app, calls, _dir, upstream_task) = resolution_setup().await;
+    let (url, task) = serve(router(app.clone())).await;
+    let response = reqwest::Client::new().post(format!("{url}/enrich-groups")).json(&json!({"organism_taxon":10090,"groups":{
+        "one":["ATR","TP53"], "two":[" atr ","ALIAS"], "missing one":["UNKNOWN"], "missing two":[" unknown "], "ambiguous":["AMBIGUOUS"]
+    }})).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let compact: Value = response.json().await.unwrap();
+    assert_eq!(compact["successful_groups"], 2);
+    assert_eq!(compact["failed_groups"], 3);
+    let full: Value = app
+        .cache
+        .get_analysis(compact["result_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    for name in ["one", "two"] {
+        assert_eq!(full["groups"][name]["result"]["organism_taxon"], 10090);
+    }
+    assert_eq!(full["groups"]["two"]["result"]["input_count"], 1);
+    assert_eq!(
+        full["groups"]["missing one"]["error"]["code"],
+        "resolution_failed"
+    );
+    assert_eq!(
+        full["groups"]["missing two"]["error"]["identifiers"][0]["reason"],
+        "unresolved"
+    );
+    assert_eq!(
+        full["groups"]["ambiguous"]["error"]["identifiers"][0]["reason"],
+        "ambiguous"
+    );
+    let requests = calls.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| r["format"] == "tsv").count(), 1);
+    // Resolver may try accession then gene, but no stage is repeated for shared inputs.
+    let queries: Vec<_> = requests.iter().map(|r| r["query"].clone()).collect();
+    let unique: std::collections::BTreeSet<_> = queries.iter().collect();
+    assert_eq!(queries.len(), unique.len());
+    assert!(queries.iter().all(|q| q.contains("10090")));
+    task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+async fn group_request_limits_and_shared_background_failure() {
+    let (app, _calls, _dir, upstream_task) = setup("failure").await;
+    let (url, task) = serve(router(app)).await;
+    let client = reqwest::Client::new();
+    let too_many: serde_json::Map<String, Value> = (0..51)
+        .map(|i| (i.to_string(), json!(["P00000"])))
+        .collect();
+    let too_large: serde_json::Map<String, Value> = (0..11)
+        .map(|i| (i.to_string(), json!(vec!["P00000"; 500])))
+        .collect();
+    for request in [
+        json!({"groups":{},"organism_taxon":9606}),
+        json!({"groups":too_many,"organism_taxon":9606}),
+        json!({"groups":too_large,"organism_taxon":9606}),
+        json!({"groups":{"a":["P00000"]}}),
+        json!({"groups":{"a":["P00000"]},"organism_taxon":0}),
+        json!({"groups":{"a":["P00000"]},"organism_taxon":9606,"source":"reactome"}),
+    ] {
+        assert_eq!(
+            client
+                .post(format!("{url}/enrich-groups"))
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        client
+            .post(format!("{url}/enrich-groups"))
+            .json(&json!({"groups":{"a":["P00000"]},"organism_taxon":9606}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    let schema: Value = client
+        .get(format!("{url}/openapi.json"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        schema["paths"]["/enrich-groups"]["post"]["operationId"],
+        "enrich_groups"
+    );
+    assert!(
+        schema["paths"]["/results/{result_id}/enrichment/terms"]["get"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["name"] == "group")
+    );
+    task.abort();
+    upstream_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "live mouse UniProt integration; downloads complete mouse reference proteome"]
+async fn live_mouse_group_enrichment() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = App {
+        cache: Cache::open(dir.path().join("mouse.sqlite").to_str().unwrap(), 30).unwrap(),
+        upstream: Upstream::new(
+            "https://rest.uniprot.org".into(),
+            "https://www.ebi.ac.uk/QuickGO/services".into(),
+        )
+        .unwrap(),
+        kegg: protein_tools::kegg::Kegg::new("https://rest.kegg.jp".into()).unwrap(),
+        permits: Arc::new(Semaphore::new(4)),
+    };
+    let (url, task) = serve(router(app.clone())).await;
+    let client = reqwest::Client::new();
+    let groups = json!({"Module 1":["P02340","Atm","Atr"],"Module 7 UP":["Brca1","Brca2","P02340"],"Module 7 DOWN":["Akt1","Egfr","P02340"]});
+    let response = client
+        .post(format!("{url}/enrich-groups"))
+        .json(&json!({"groups":groups,"organism_taxon":10090,"source":"go_bp"}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.bytes().await.unwrap();
+    let summary: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(status, StatusCode::OK, "{summary}");
+    if summary["complete"] != true {
+        let failed: Value = app
+            .cache
+            .get_analysis(summary["result_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        for (name, outcome) in failed["groups"].as_object().unwrap() {
+            if !outcome["error"].is_null() {
+                println!("failed live group {name}: {}", outcome["error"]);
+            }
+        }
+    }
+    assert_eq!(summary["successful_groups"], 3, "{summary}");
+    assert_eq!(summary["failed_groups"], 0, "{summary}");
+    assert!(bytes.len() < 4096);
+    let id = summary["result_id"].as_str().unwrap();
+    let full: Value = app.cache.get_analysis(id).await.unwrap().unwrap();
+    for group in groups.as_object().unwrap().keys() {
+        assert_eq!(full["groups"][group]["result"]["organism_taxon"], 10090);
+        assert_eq!(full["groups"][group]["result"]["input_count"], 3);
+        assert_eq!(
+            full["groups"][group]["result"]["universe"],
+            full["groups"]["Module 1"]["result"]["universe"]
+        );
+    }
+    let page: Value = client
+        .get(format!("{url}/results/{id}/enrichment/terms"))
+        .query(&[("group", "Module 7 UP"), ("limit", "2")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    assert_eq!(page["has_more"], true);
+    let detail: Value = client
+        .get(format!("{url}/results/{id}/enrichment/group"))
+        .query(&[("group", "Module 7 UP")])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["input_identifiers"], groups["Module 7 UP"]);
+    let generic: Value = client
+        .get(format!("{url}/results/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(generic["truncated"], true);
+    assert!(generic.get("groups").is_none());
+    println!("mouse batch summary ({}) bytes: {summary}", bytes.len());
+    println!("selected group: {detail}");
+    println!("selected page: {page}");
+    println!("generic protection: {generic}");
+    task.abort();
+}
