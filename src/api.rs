@@ -230,13 +230,18 @@ async fn compare_kegg_pathways(
     ))
 }
 #[utoipa::path(post, path="/enrich-proteins", operation_id="enrich_proteins", request_body=EnrichmentRequest,
-    responses((status=200, description="Compact GO BP overrepresentation result; complete data saved under result_id", body=EnrichmentResponse), (status=400, description="Invalid input or protein outside human background"), (status=404, description="Result absent or expired"), (status=502, description="Upstream data unavailable or incomplete"), (status=500, description="Result cache or calculation failed")))]
-/// Run deterministic human GO Biological Process enrichment before inspecting raw annotations. Supply proteins OR result_id. Uses the entire UniProt human proteome, a one-sided hypergeometric test and Benjamini-Hochberg FDR over all background terms. Returns at most ten terms; use result_id to retrieve the complete cached result. Cold background loading requires paginated UniProt requests.
+    responses((status=200, description="Compact GO BP overrepresentation result; complete data saved under result_id", body=EnrichmentResponse), (status=400, description="Invalid context, unresolved/ambiguous identifiers, or protein outside annotation universe"), (status=404, description="Result absent or expired"), (status=502, description="Upstream data unavailable or incomplete"), (status=500, description="Result cache or calculation failed")))]
+/// Run deterministic organism-scoped GO Biological Process enrichment before inspecting raw annotations. Supply proteins OR result_id and organism_taxon (NCBI taxonomy ID). Uses canonical entries with non-root GO BP annotations in the selected taxon's reference proteome, a one-sided hypergeometric test and Benjamini-Hochberg FDR over all background terms. Returns at most ten terms; use result_id to retrieve the complete cached result. Cold background loading requires paginated UniProt requests.
 async fn enrich_proteins(
     State(app): State<App>,
     request: Result<Json<EnrichmentRequest>, JsonRejection>,
-) -> Result<Json<EnrichmentResponse>, (StatusCode, String)> {
-    let Json(request) = request.map_err(|e| (StatusCode::BAD_REQUEST, e.body_text()))?;
+) -> Result<Json<EnrichmentResponse>, crate::enrichment::Error> {
+    let Json(request) = request.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error":{"code":"invalid_request","message":e.body_text()}})),
+        )
+    })?;
     app.enrich(request).await.map(Json)
 }
 #[utoipa::path(get, path="/results/{result_id}", operation_id="getCachedResult", params(("result_id" = String, Path, description="Cached result ID")),

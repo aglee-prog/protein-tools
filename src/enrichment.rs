@@ -10,18 +10,37 @@ use statrs::distribution::{DiscreteCDF, Hypergeometric};
 use std::collections::{BTreeMap, BTreeSet};
 use utoipa::ToSchema;
 
-const SNAPSHOT_KEY: &str = "go_bp_human_proteome_v1";
-const BACKGROUND_QUERY: &str = "proteome:UP000005640 AND organism_id:9606";
+fn background_query(taxon: u64, proteome: &str) -> String {
+    format!("proteome:{proteome} AND organism_id:{taxon}")
+}
 const FDR_THRESHOLD: f64 = 0.05;
-type Error = (StatusCode, String);
+pub type Error = (StatusCode, axum::Json<serde_json::Value>);
+fn failure(
+    status: StatusCode,
+    code: &str,
+    message: impl Into<String>,
+    identifiers: Vec<String>,
+) -> Error {
+    (
+        status,
+        axum::Json(
+            serde_json::json!({"error": {"code": code, "message": message.into(), "identifiers": identifiers}}),
+        ),
+    )
+}
 fn bad(message: impl Into<String>) -> Error {
-    (StatusCode::BAD_REQUEST, message.into())
+    failure(StatusCode::BAD_REQUEST, "invalid_request", message, vec![])
 }
 fn upstream(message: impl Into<String>) -> Error {
-    (StatusCode::BAD_GATEWAY, message.into())
+    failure(StatusCode::BAD_GATEWAY, "upstream_error", message, vec![])
 }
 fn internal(message: String) -> Error {
-    (StatusCode::INTERNAL_SERVER_ERROR, message)
+    failure(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+        message,
+        vec![],
+    )
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -34,7 +53,9 @@ pub struct EnrichmentRequest {
     pub result_id: Option<String>,
     /// Only go_bp is supported; omitted means go_bp.
     pub source: Option<String>,
-    /// Only human_proteome is supported; omitted means human_proteome.
+    /// NCBI taxonomy ID. Required for a new analysis; inherited from cached enrichment results.
+    pub organism_taxon: Option<u64>,
+    /// Only proteome is supported; omitted means proteome.
     pub background: Option<String>,
 }
 #[derive(Clone, Deserialize, Serialize, ToSchema)]
@@ -51,6 +72,10 @@ pub struct EnrichmentTerm {
 }
 #[derive(Deserialize, Serialize, ToSchema)]
 pub struct EnrichmentResult {
+    pub organism_taxon: u64,
+    pub input_identifiers: Vec<String>,
+    pub identifier_mapping: Vec<IdentifierMapping>,
+    pub universe: UniverseMetadata,
     pub method: String,
     pub source: String,
     pub background: String,
@@ -63,6 +88,26 @@ pub struct EnrichmentResult {
     pub proteins: Vec<String>,
     pub items: Vec<EnrichmentTerm>,
 }
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+pub struct IdentifierMapping {
+    pub input: String,
+    pub canonical: String,
+}
+#[derive(Clone, Deserialize, Serialize, ToSchema)]
+pub struct UniverseMetadata {
+    pub proteome_id: String,
+    pub unit: String,
+    pub selection: String,
+    pub proteome_entry_count: usize,
+    pub reviewed_entry_count: usize,
+    pub unreviewed_entry_count: usize,
+    /// Distinct NCBI GeneID cross-references across all proteome entries; not a complete gene census.
+    pub unique_gene_id_count: usize,
+    pub entries_without_gene_id: usize,
+    pub annotated_entry_count: usize,
+    pub unannotated_entry_count: usize,
+    pub eligible_accessions: Vec<String>,
+}
 #[derive(Serialize, ToSchema)]
 pub struct TopTerm {
     pub id: String,
@@ -73,6 +118,7 @@ pub struct TopTerm {
 }
 #[derive(Serialize, ToSchema)]
 pub struct EnrichmentResponse {
+    pub organism_taxon: u64,
     pub result_id: String,
     pub method: String,
     pub source: String,
@@ -87,6 +133,11 @@ pub struct EnrichmentResponse {
 }
 #[derive(Clone, Deserialize, Serialize)]
 struct Background {
+    proteome_id: String,
+    taxon: u64,
+    reviewed: usize,
+    gene_ids: BTreeSet<String>,
+    entries_without_gene_id: usize,
     release: String,
     proteins: BTreeSet<String>,
     terms: BTreeMap<String, BackgroundTerm>,
@@ -98,15 +149,39 @@ struct BackgroundTerm {
 }
 
 impl Background {
+    fn eligible(&self) -> BTreeSet<String> {
+        self.terms
+            .values()
+            .flat_map(|t| t.proteins.iter().cloned())
+            .collect()
+    }
     fn add_page(&mut self, body: &str) -> Result<(), String> {
         let mut lines = body.lines();
-        if lines.next() != Some("Entry\tGene Ontology (biological process)") {
+        if lines.next() != Some("Entry\tReviewed\tGeneID\tGene Ontology (biological process)") {
             return Err("invalid UniProt GO BP header".into());
         }
         let mut count = 0;
         for line in lines {
-            let (accession, annotations) =
-                line.split_once('\t').ok_or("invalid UniProt GO BP row")?;
+            let columns: Vec<_> = line.split('\t').collect();
+            let [accession, reviewed, genes, annotations] = columns.as_slice() else {
+                return Err("invalid UniProt GO BP row".into());
+            };
+            let (accession, annotations) = (*accession, *annotations);
+            match *reviewed {
+                "reviewed" => self.reviewed += 1,
+                "unreviewed" => (),
+                _ => return Err("invalid review status".into()),
+            }
+            if genes.is_empty() {
+                self.entries_without_gene_id += 1;
+            }
+            self.gene_ids.extend(
+                genes
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|g| !g.is_empty())
+                    .map(String::from),
+            );
             if accession.is_empty()
                 || !accession.bytes().all(|c| c.is_ascii_alphanumeric())
                 || !self.proteins.insert(accession.to_owned())
@@ -153,22 +228,93 @@ impl Background {
     }
 }
 impl Upstream {
-    async fn human_go_background(&self) -> Result<Background, String> {
+    async fn go_background(&self, taxon: u64) -> Result<Background, String> {
+        // Taxonomy searches can include descendants: verify the exact taxon locally.
+        let response = self
+            .get(
+                &format!("{}/proteomes/search", self.uniprot),
+                &[
+                    ("query", format!("taxonomy_id:{taxon}")),
+                    ("format", "json".into()),
+                    ("size", "500".into()),
+                ],
+            )
+            .await?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "UniProt proteome discovery returned HTTP {}",
+                response.status().as_u16()
+            ));
+        }
+        if response
+            .headers()
+            .get("link")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("rel=\"next\""))
+        {
+            return Err(
+                "proteome discovery incomplete; cannot select a unique reference proteome".into(),
+            );
+        }
+        #[derive(Deserialize)]
+        struct ProteomeSearch {
+            results: Vec<Proteome>,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Proteome {
+            id: String,
+            proteome_type: String,
+            taxonomy: Taxonomy,
+        }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Taxonomy {
+            taxon_id: u64,
+        }
+        let search: ProteomeSearch = response
+            .json()
+            .await
+            .map_err(|_| "invalid UniProt proteome discovery response")?;
+        let ids: BTreeSet<_> = search
+            .results
+            .into_iter()
+            .filter(|p| p.taxonomy.taxon_id == taxon && p.proteome_type == "Reference proteome")
+            .map(|p| p.id)
+            .collect();
+        if ids.len() != 1 {
+            return Err(format!(
+                "organism_taxon {taxon} must have exactly one reference proteome; found {}",
+                ids.len()
+            ));
+        }
+        let proteome_id = ids.into_iter().next().unwrap();
+        if proteome_id.len() != 11
+            || !proteome_id.starts_with("UP")
+            || !proteome_id[2..].bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err("invalid reference proteome ID".into());
+        }
         let endpoint = format!("{}/uniprotkb/search", self.uniprot);
         let base = reqwest::Url::parse(&endpoint).map_err(|_| "invalid UniProt URL")?;
         let mut cursor = None;
         let mut seen = BTreeSet::new();
         let mut expected = None;
         let mut background = Background {
+            proteome_id: proteome_id.clone(),
+            taxon,
+            reviewed: 0,
+            gene_ids: BTreeSet::new(),
+            entries_without_gene_id: 0,
             release: String::new(),
             proteins: BTreeSet::new(),
             terms: BTreeMap::new(),
         };
         for _ in 0..1000 {
             let mut params = vec![
-                ("query", BACKGROUND_QUERY.into()),
+                ("query", background_query(taxon, &proteome_id)),
                 ("format", "tsv".into()),
-                ("fields", "accession,go_p".into()),
+                ("fields", "accession,reviewed,xref_geneid,go_p".into()),
                 ("size", "500".into()),
             ];
             if let Some(cursor) = cursor.take() {
@@ -270,11 +416,14 @@ fn calculate(
     background: &Background,
     proteins: BTreeSet<String>,
 ) -> Result<EnrichmentResult, String> {
-    if proteins.is_empty() || !proteins.is_subset(&background.proteins) {
-        return Err("input must be a nonempty subset of the human proteome".into());
+    let eligible = background.eligible();
+    if proteins.is_empty() || !proteins.is_subset(&eligible) {
+        return Err(
+            "input must be a nonempty subset of the GO BP annotated proteome universe".into(),
+        );
     }
     let n = proteins.len();
-    let population = background.proteins.len();
+    let population = eligible.len();
     let mut items = Vec::with_capacity(background.terms.len());
     for (id, term) in &background.terms {
         let hits: Vec<_> = proteins.intersection(&term.proteins).cloned().collect();
@@ -303,7 +452,28 @@ fn calculate(
     }
     // Test every annotated background term, including zero-hit terms (p = 1).
     benjamini_hochberg(&mut items);
-    Ok(EnrichmentResult { method: "overrepresentation".into(), source: "go_bp".into(), background: "human_proteome".into(), background_query: BACKGROUND_QUERY.into(), annotation_policy: "UniProt go_p positive BP associations; all evidence; no additional ancestor propagation; GO root excluded; unannotated proteins included".into(), uniprot_release: background.release.clone(), input_count: n, background_count: population, tested_terms: items.len(), proteins: proteins.into_iter().collect(), items })
+    Ok(EnrichmentResult {
+        organism_taxon: background.taxon,
+        input_identifiers: vec![], identifier_mapping: vec![],
+        universe: UniverseMetadata {
+            proteome_id: background.proteome_id.clone(),
+            unit: "UniProtKB primary accession (canonical entry), not gene or isoform".into(),
+            selection: "Unique reference proteome for the exact taxon; reviewed and unreviewed; at least one non-root GO BP association; no gene-level collapsing".into(),
+            proteome_entry_count: background.proteins.len(),
+            reviewed_entry_count: background.reviewed,
+            unreviewed_entry_count: background.proteins.len() - background.reviewed,
+            unique_gene_id_count: background.gene_ids.len(),
+            entries_without_gene_id: background.entries_without_gene_id,
+            annotated_entry_count: population,
+            unannotated_entry_count: background.proteins.len() - population,
+            eligible_accessions: eligible.into_iter().collect(),
+        },
+        method: "overrepresentation".into(), source: "go_bp".into(), background: "proteome".into(),
+        background_query: background_query(background.taxon, &background.proteome_id),
+        annotation_policy: "UniProt go_p positive BP associations; all evidence; no additional ancestor propagation; GO root excluded; unannotated entries ineligible; N=annotated_entry_count".into(),
+        uniprot_release: background.release.clone(), input_count: n, background_count: population,
+        tested_terms: items.len(), proteins: proteins.into_iter().collect(), items,
+    })
 }
 
 impl App {
@@ -312,12 +482,14 @@ impl App {
             || request
                 .background
                 .as_deref()
-                .is_some_and(|s| s != "human_proteome")
+                .is_some_and(|s| s != "proteome")
         {
             return Err(bad(
-                "only source=go_bp and background=human_proteome are supported",
+                "only source=go_bp and background=proteome are supported",
             ));
         }
+        let mut taxon = request.organism_taxon;
+        let mut saved_mapping: Option<Vec<IdentifierMapping>> = None;
         let proteins = match (request.proteins, request.result_id) {
             (Some(proteins), None) => proteins,
             (None, Some(id)) => {
@@ -329,11 +501,28 @@ impl App {
                     .get_analysis(&id)
                     .await
                     .map_err(internal)?
-                    .ok_or((
-                        StatusCode::NOT_FOUND,
-                        "result_id not found or expired".into(),
-                    ))?;
+                    .ok_or_else(|| {
+                        failure(
+                            StatusCode::NOT_FOUND,
+                            "result_not_found",
+                            "result_id not found or expired",
+                            vec![],
+                        )
+                    })?;
                 if value.get("method").and_then(|v| v.as_str()) == Some("overrepresentation") {
+                    if let Some(saved_taxon) = value.get("organism_taxon").and_then(|v| v.as_u64())
+                    {
+                        if taxon.is_some_and(|id| id != saved_taxon) {
+                            return Err(bad("organism_taxon conflicts with cached result"));
+                        }
+                        taxon = Some(saved_taxon);
+                    }
+                    saved_mapping = value
+                        .get("identifier_mapping")
+                        .cloned()
+                        .map(serde_json::from_value)
+                        .transpose()
+                        .map_err(|_| bad("invalid cached identifier mapping"))?;
                     serde_json::from_value(
                         value
                             .get("proteins")
@@ -349,12 +538,29 @@ impl App {
                             .ok_or_else(|| bad("cached result has no protein records"))?,
                     )
                     .map_err(|_| bad("cached result has no protein records"))?;
-                    items.into_iter().map(|p| {
-                        if !p.found || p.organism.as_deref() != Some("Homo sapiens") {
-                            return Err(bad("cached protein result contains unresolved or nonhuman proteins"));
-                        }
-                        p.uniprot_id.ok_or_else(|| bad("cached protein result lacks an accession"))
-                    }).collect::<Result<Vec<_>, _>>()?
+                    let invalid: Vec<_> = items
+                        .iter()
+                        .filter(|p| !p.found || p.uniprot_id.is_none())
+                        .map(|p| p.query.clone())
+                        .collect();
+                    if !invalid.is_empty() {
+                        return Err(failure(
+                            StatusCode::BAD_REQUEST,
+                            "resolution_failed",
+                            "cached result contains unresolved proteins",
+                            invalid,
+                        ));
+                    }
+                    let mapping: Vec<_> = items
+                        .into_iter()
+                        .map(|p| IdentifierMapping {
+                            input: p.query,
+                            canonical: p.uniprot_id.unwrap(),
+                        })
+                        .collect();
+                    let proteins = mapping.iter().map(|p| p.canonical.clone()).collect();
+                    saved_mapping = Some(mapping);
+                    proteins
                 }
             }
             _ => return Err(bad("supply exactly one of proteins or result_id")),
@@ -367,39 +573,87 @@ impl App {
         {
             return Err(bad("proteins must contain 1 to 500 valid identifiers"));
         }
+        let taxon = taxon.filter(|id| *id > 0).ok_or_else(|| failure(
+            StatusCode::BAD_REQUEST, "organism_required", "provide organism_taxon (NCBI taxonomy ID) to select the resolution context and proteome universe", proteins.clone()))?;
         let queries: BTreeSet<_> = proteins.iter().map(|p| normalize(p, None).0).collect();
-        // Reuse the protein cache and exact resolver without fetching redundant
-        // per-input QuickGO annotations: analysis uses one consistent GO snapshot.
+        // Taxon-scoped cache namespace avoids stale name/alias resolution from v1.
+        // Both enrichment and lookup use the same resolver and ranking policy.
         let resolved: Vec<_> = stream::iter(queries.into_iter().map(|query| async move {
-            let _permit = self
-                .permits
-                .acquire()
-                .await
-                .map_err(|_| internal("server shutting down".into()))?;
-            let key = normalize(&query, Some("Homo sapiens"));
-            let protein = match self.cache.get(key.clone()).await.map_err(internal)? {
-                Some(protein) => Some(protein),
-                None => self
-                    .upstream
-                    .resolve(&key.0, &key.1)
+            let outcome = async {
+                let _permit = self
+                    .permits
+                    .acquire()
                     .await
-                    .map_err(upstream)?,
+                    .map_err(|_| "server shutting down".to_owned())?;
+                let key = (query.clone(), format!("taxon:{taxon}:resolver_v2"));
+                let protein = match self.cache.get(key.clone()).await? {
+                    Some(protein) => Some(protein),
+                    None => {
+                        let protein = self.upstream.resolve_taxon(&query, taxon).await?;
+                        if let Some(protein) = &protein {
+                            self.cache.put(key, protein.clone()).await?;
+                        }
+                        protein
+                    }
+                };
+                Ok::<_, String>(protein.filter(|p| p.found).and_then(|p| p.uniprot_id))
             }
-            .ok_or_else(|| bad(format!("human protein not found: {query}")))?;
-            if !protein.found || protein.organism.as_deref() != Some("Homo sapiens") {
-                return Err(bad(format!("not a resolved human protein: {query}")));
-            }
-            protein
-                .uniprot_id
-                .ok_or_else(|| bad(format!("missing accession: {query}")))
+            .await;
+            (query, outcome)
         }))
         .buffered(MAX_CONCURRENT_LOOKUPS)
         .collect()
         .await;
-        let proteins: BTreeSet<_> = resolved.into_iter().collect::<Result<_, _>>()?;
+        let mut canonical = BTreeMap::new();
+        let mut issues = vec![];
+        let mut upstream_failed = false;
+        for (identifier, outcome) in resolved {
+            match outcome {
+                Ok(Some(id)) => {
+                    canonical.insert(identifier, id);
+                }
+                Ok(None) => {
+                    issues.push(serde_json::json!({"identifier":identifier,"reason":"unresolved"}))
+                }
+                Err(message) => {
+                    let reason = if message.contains("ambiguous")
+                        || message.contains("candidate set too large")
+                    {
+                        "ambiguous"
+                    } else {
+                        upstream_failed = true;
+                        "upstream_error"
+                    };
+                    issues.push(serde_json::json!({"identifier":identifier,"reason":reason,"message":message}));
+                }
+            }
+        }
+        if !issues.is_empty() {
+            return Err((
+                if upstream_failed {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+                axum::Json(serde_json::json!({"error":{
+                    "code":"resolution_failed", "organism_taxon":taxon, "message":"Every identifier must resolve; no analysis performed", "identifiers":issues
+                }})),
+            ));
+        }
+        let mapping = saved_mapping.unwrap_or_else(|| {
+            proteins
+                .iter()
+                .map(|p| IdentifierMapping {
+                    input: p.clone(),
+                    canonical: canonical[&normalize(p, None).0].clone(),
+                })
+                .collect()
+        });
+        let proteins: BTreeSet<_> = canonical.into_values().collect();
+        let snapshot_key = format!("go_bp_proteome_taxon_{taxon}_v2");
         let background = match self
             .cache
-            .get_analysis::<Background>(SNAPSHOT_KEY)
+            .get_analysis::<Background>(&snapshot_key)
             .await
             .map_err(internal)?
         {
@@ -410,30 +664,32 @@ impl App {
                     .acquire()
                     .await
                     .map_err(|_| internal("server shutting down".into()))?;
-                let background = self
-                    .upstream
-                    .human_go_background()
-                    .await
-                    .map_err(upstream)?;
+                let background = self.upstream.go_background(taxon).await.map_err(upstream)?;
                 self.cache
-                    .put_analysis(Some(SNAPSHOT_KEY.into()), background.clone())
+                    .put_analysis(Some(snapshot_key), background.clone())
                     .await
                     .map_err(internal)?;
                 background
             }
         };
-        let outside: Vec<_> = proteins.difference(&background.proteins).cloned().collect();
+        let eligible = background.eligible();
+        let outside: Vec<_> = proteins.difference(&eligible).cloned().collect();
         if !outside.is_empty() {
-            return Err(bad(format!(
-                "proteins outside human_proteome: {}",
-                outside.join(", ")
-            )));
+            return Err(failure(
+                StatusCode::BAD_REQUEST,
+                "outside_annotation_universe",
+                "proteins outside the selected taxon's proteome or without non-root GO BP annotations; no analysis performed",
+                outside,
+            ));
         }
-        let result = tokio::task::spawn_blocking(move || calculate(&background, proteins))
+        let mut result = tokio::task::spawn_blocking(move || calculate(&background, proteins))
             .await
             .map_err(|e| internal(e.to_string()))?
             .map_err(internal)?;
+        result.input_identifiers = mapping.iter().map(|m| m.input.clone()).collect();
+        result.identifier_mapping = mapping;
         let response = EnrichmentResponse {
+            organism_taxon: taxon,
             result_id: String::new(),
             method: result.method.clone(),
             source: result.source.clone(),
@@ -482,11 +738,16 @@ mod tests {
 
     fn background() -> Background {
         let mut background = Background {
+            proteome_id: "UP000005640".into(),
+            taxon: 9606,
+            reviewed: 0,
+            gene_ids: BTreeSet::new(),
+            entries_without_gene_id: 0,
             release: "test".into(),
             proteins: BTreeSet::new(),
             terms: BTreeMap::new(),
         };
-        let mut body = "Entry\tGene Ontology (biological process)\n".to_owned();
+        let mut body = "Entry\tReviewed\tGeneID\tGene Ontology (biological process)\n".to_owned();
         for i in 0..20 {
             let annotation = if i < 7 {
                 "process A [GO:0000001]"
@@ -495,7 +756,7 @@ mod tests {
             } else {
                 ""
             };
-            body.push_str(&format!("P{i:05}\t{annotation}\n"));
+            body.push_str(&format!("P{i:05}\treviewed\t{i};\t{annotation}\n"));
         }
         background.add_page(&body).unwrap();
         background
@@ -504,23 +765,33 @@ mod tests {
     fn hypergeometric_tail_and_bh_include_zero_hits() {
         let result =
             calculate(&background(), (0..5).map(|i| format!("P{i:05}")).collect()).unwrap();
-        // P(X >= 5) = C(7,5) C(13,0) / C(20,5) = 21 / 15504.
-        let expected = 21.0 / 15504.0;
+        // N=10 annotated entries: P(X >= 5) = C(7,5) / C(10,5).
+        let expected = 21.0 / 252.0;
         assert!((result.items[0].p_value - expected).abs() < 1e-12);
         assert!((result.items[0].fdr - 2.0 * expected).abs() < 1e-12);
         assert_eq!(result.items[1].p_value, 1.0);
         assert_eq!(result.items[1].hit_count, 0);
-        assert_eq!(result.background_count, 20); // includes ten unannotated proteins
+        assert_eq!(result.background_count, 10); // excludes ten unannotated proteins
         assert_eq!(result.items[0].proteins.len(), 5);
-        // A tail with more than one outcome: C(7,3)C(13,2) + C(7,4)C(13,1) + C(7,5).
+        // A tail with more than one outcome: C(7,3)C(3,2) + C(7,4)C(3,1) + C(7,5).
         let result = calculate(
             &background(),
-            ["P00000", "P00001", "P00002", "P00010", "P00011"]
+            ["P00000", "P00001", "P00002", "P00007", "P00008"]
                 .map(String::from)
                 .into(),
         )
         .unwrap();
-        assert!((result.items[0].p_value - 3206.0 / 15504.0).abs() < 1e-12);
+        assert!(
+            (result
+                .items
+                .iter()
+                .find(|t| t.id == "GO:0000001")
+                .unwrap()
+                .p_value
+                - 231.0 / 252.0)
+                .abs()
+                < 1e-12
+        );
     }
     #[test]
     fn bh_monotonicity_ties_and_bounds() {
@@ -546,26 +817,30 @@ mod tests {
     fn parsing_and_population_edges() {
         let mut bg = background();
         assert!(
-            bg.add_page("Entry\tGene Ontology (biological process)\nP00000\t\n")
+            bg.add_page("Entry\tReviewed\tGeneID\tGene Ontology (biological process)\nP00000\treviewed\t\t\n")
                 .is_err()
         );
         assert!(
-            bg.add_page("Entry\tGene Ontology (biological process)\nP99999\tbad term\n")
+            bg.add_page("Entry\tReviewed\tGeneID\tGene Ontology (biological process)\nP99999\treviewed\t\tbad term\n")
                 .is_err()
         );
         assert!(calculate(&bg, BTreeSet::new()).is_err());
         assert!(calculate(&bg, ["ABSENT".into()].into()).is_err());
         let bg = background();
-        let all = calculate(&bg, bg.proteins.clone()).unwrap();
+        let all = calculate(&bg, bg.eligible()).unwrap();
         assert!(all.items.iter().all(|t| (t.p_value - 1.0).abs() < 1e-12));
-        let none = calculate(&bg, ["P00019".into()].into()).unwrap();
-        assert!(none.items.iter().all(|t| t.p_value == 1.0));
+        assert!(calculate(&bg, ["P00019".into()].into()).is_err());
         let mut bg = Background {
+            proteome_id: "UP000005640".into(),
+            taxon: 9606,
+            reviewed: 0,
+            gene_ids: BTreeSet::new(),
+            entries_without_gene_id: 0,
             release: "test".into(),
             proteins: BTreeSet::new(),
             terms: BTreeMap::new(),
         };
-        bg.add_page("Entry\tGene Ontology (biological process)\nP00001\troot [GO:0008150]; test [GO:0000001]; test [GO:0000001]\n").unwrap();
+        bg.add_page("Entry\tReviewed\tGeneID\tGene Ontology (biological process)\nP00001\treviewed\t\troot [GO:0008150]; test [GO:0000001]; test [GO:0000001]\n").unwrap();
         assert_eq!(bg.terms.len(), 1);
         assert_eq!(bg.terms["GO:0000001"].proteins.len(), 1);
     }

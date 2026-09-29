@@ -1,6 +1,6 @@
 # protein-tools
 
-Small Rust OpenAPI tool server for authoritative UniProt protein facts and QuickGO annotations. It performs exact lookup and normalization, plus deterministic human GO Biological Process overrepresentation analysis.
+Small Rust OpenAPI tool server for authoritative UniProt protein facts and QuickGO annotations. It performs exact lookup and normalization, plus deterministic organism-scoped GO Biological Process overrepresentation analysis.
 
 ## Run
 
@@ -274,17 +274,17 @@ No cache tables, cache keys, or existing lookup request/response schemas change.
 
 `POST /enrich-proteins`, OpenAPI operation **`enrich_proteins`**, accepts exactly
 one of `proteins` (1–500 gene symbols or UniProt accessions) or `result_id`.
-Only `source="go_bp"` and `background="human_proteome"` are supported and are
-the defaults. Prefer this deterministic tool before inspecting large annotation
-sets; the model chooses the analysis, while the service calculates statistics.
-
+Use `organism_taxon` (an NCBI taxonomy ID) for every new analysis, including
+accession inputs. `source="go_bp"` and `background="proteome"` are the supported
+defaults. A cached enrichment result supplies its own taxon; a conflicting taxon
+is rejected. There is no implicit human default.
 ```sh
 curl --fail-with-body http://127.0.0.1:8091/enrich-proteins \
   -H 'Content-Type: application/json' \
-  -d '{"proteins":["TP53","EGFR","AKT1"],"source":"go_bp","background":"human_proteome"}'
+  -d '{"proteins":["TP53","EGFR","AKT1"],"organism_taxon":9606,"source":"go_bp","background":"proteome"}'
 ```
 
-The compact response contains `result_id`, `method`, `source`, `background`,
+The compact response contains `result_id`, `organism_taxon`, `method`, `source`, `background`,
 `input_count`, `background_count`, `tested_terms`, `significant_terms`,
 `fdr_threshold` (0.05), and at most ten `top_terms` with GO ID, name, hit count,
 p-value and FDR. Terms are ordered by FDR, p-value, then GO ID. Top terms may
@@ -293,31 +293,60 @@ significance. Protein lists and the full term collection stay outside this respo
 
 `GET /results/{result_id}` retrieves the complete saved result, including every
 tested term, hit accessions, input and background counts, p-values, FDR, resolved
-input accessions, UniProt release, background query and annotation policy.
+input accessions, original `input_identifiers`, ordered `identifier_mapping`,
+UniProt release, background query, annotation policy and `universe` metadata.
+The latter records entry/review/gene-ID coverage counts and the exact
+`eligible_accessions` used as the statistical population.
 `POST /enrich-proteins` with `{"result_id":"result_..."}` reanalyzes that protein
 set using the currently cached background. The generic full-result endpoint is
 intended for explicit retrieval; term-level drill-down remains Stage 2.
 
 `POST /protein-info` retains its existing JSON array response and additionally
 returns `X-Result-Id` when storage succeeds. That ID identifies the full unfiltered
-protein batch (`proteins` and `items`) and can be supplied to enrichment. Cached
-batches containing unresolved or nonhuman records are rejected; original gene
-symbols are not reinterpreted across species. If saving a protein batch fails,
+protein batch (`proteins` and `items`) and can be supplied to enrichment. Provide `organism_taxon` when using a protein-info result ID. Cached
+batches containing unresolved records are rejected; their canonical accessions
+are validated against the requested taxon, preserving the original query mapping. If saving a protein batch fails,
 the lookup still succeeds without the header; an enrichment cache-write failure
 returns HTTP 500 rather than an unusable result ID. Tool clients that do not
 expose response headers can supply `proteins` directly.
 
 ### Population and annotation policy
 
-The background is **all primary UniProtKB entries** selected by
-`proteome:UP000005640 AND organism_id:9606`, including reviewed and unreviewed
-entries and proteins without GO BP annotations. This is an accession-level
-population, not a fixed 20,000-gene universe or a one-protein-per-gene subset.
-Its actual size is returned; the supplied input never replaces the background.
-The existing exact human UniProt resolver and protein cache resolve inputs.
-Aliases and repeated accessions count once. Unknown/ambiguous identifiers,
-nonhuman proteins, and accessions outside the selected proteome fail explicitly;
-no proteins are silently dropped.
+The analysis unit is a **distinct primary UniProtKB accession**, representing a
+canonical entry, not a gene or an expanded isoform sequence. The background query
+is `proteome:<discovered_id> AND organism_id:<organism_taxon>`. The service
+discovers the exact taxon’s unique reference proteome using UniProt’s proteomes
+API; missing, ambiguous or incomplete discovery fails explicitly. The selected
+ID is recorded as `universe.proteome_id`. Entries are deduplicated by accession. Both reviewed and unreviewed
+entries are eligible. Multiple entries associated with the same gene remain
+separate units; no one-protein-per-gene selection is implied.
+
+Only entries with at least one non-root GO BP association are eligible for this
+annotation-conditioned analysis. `N = background_count = universe.annotated_entry_count`;
+`n = input_count` is the number of distinct resolved input accessions, all of which
+must belong to that universe. Term membership `K` and input hits `k` come from the
+same snapshot. Unannotated/out-of-proteome inputs fail explicitly rather than
+being silently removed. Every background term is tested, including zero-hit terms.
+The full entry count remains in `universe.proteome_entry_count` for auditing.
+`unique_gene_id_count` counts available NCBI GeneID cross-references, not all genes;
+`entries_without_gene_id` makes incomplete cross-reference coverage visible.
+
+The shared protein resolver uses exact accession, then exact primary gene symbol,
+then exact synonym, with the existing reviewed-entry preference within a symbol
+priority. Multiple equally ranked matches remain ambiguous. Inputs are resolved
+within the explicit numeric taxon. Repeated identifiers and aliases count once,
+while every original input and canonical mapping is retained in the cached result.
+Taxon-specific resolver and background cache keys isolate organisms and exclude
+old human-only snapshots.
+
+Errors are JSON objects under `error`. Missing context returns `organism_required`;
+unresolved/ambiguous identifiers return `resolution_failed` with an `identifiers`
+array containing per-identifier reasons. Upstream resolution failures use HTTP 502;
+identifier/context failures use HTTP 400. No partial analysis is produced.
+Inputs without usable GO BP membership return `outside_annotation_universe`.
+
+See [the background audit](docs/enrichment-background-audit.md) for the original
+147,520-entry population, its composition, and the rationale for this universe.
 
 Both input and background term membership come from the **same complete
 UniProt `go_p` snapshot**. This reuses the existing UniProt client and avoids
@@ -326,7 +355,7 @@ one QuickGO request per proteome entry. Existing QuickGO lookup behavior is
 unchanged. The analysis uses UniProt's positive BP associations with all evidence,
 without adding ancestor propagation; it excludes the BP root `GO:0008150`.
 It therefore analyzes the associations supplied by UniProt, and is not an
-ancestor-expanded GO analysis. Unannotated input proteins remain in the draw size.
+ancestor-expanded GO analysis. Unannotated inputs are rejected before calculation.
 
 A one-sided hypergeometric survival probability, `P(X >= observed_hits)`, is
 computed with `statrs`, equivalent to the enrichment tail of Fisher's exact test.

@@ -39,6 +39,7 @@ struct Gene {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Organism {
+    taxon_id: Option<u64>,
     scientific_name: String,
 }
 #[derive(Deserialize)]
@@ -97,10 +98,29 @@ impl Upstream {
         query: &str,
         organism: &str,
     ) -> Result<Option<ProteinResult>, String> {
+        self.resolve_context(query, organism, None).await
+    }
+
+    pub async fn resolve_taxon(
+        &self,
+        query: &str,
+        taxon: u64,
+    ) -> Result<Option<ProteinResult>, String> {
+        self.resolve_context(query, "", Some(taxon)).await
+    }
+
+    async fn resolve_context(
+        &self,
+        query: &str,
+        organism: &str,
+        taxon: Option<u64>,
+    ) -> Result<Option<ProteinResult>, String> {
         for field in ["accession", "gene_exact"] {
             tracing::info!(event = "uniprot_lookup", strategy = field, query);
             let mut expression = format!("{field}:{}", quote(query));
-            if !organism.is_empty() {
+            if let Some(taxon) = taxon {
+                expression.push_str(&format!(" AND organism_id:{taxon}"));
+            } else if !organism.is_empty() {
                 expression.push_str(&format!(" AND organism_name:{}", quote(organism)));
             }
             let response = self
@@ -139,8 +159,9 @@ impl Upstream {
                 .results
                 .into_iter()
                 .filter(|r| {
-                    (organism.is_empty()
-                        || r.organism.scientific_name.eq_ignore_ascii_case(organism))
+                    taxon.is_none_or(|id| r.organism.taxon_id == Some(id))
+                        && (organism.is_empty()
+                            || r.organism.scientific_name.eq_ignore_ascii_case(organism))
                         && if field == "accession" {
                             r.primary_accession.eq_ignore_ascii_case(query)
                         } else {
@@ -153,6 +174,25 @@ impl Upstream {
                         }
                 })
                 .collect();
+            // Primary symbols outrank aliases, including aliases of reviewed entries.
+            // Do not guess between multiple candidates at the same priority.
+            if field == "gene_exact"
+                && exact.iter().any(|r| {
+                    r.genes.iter().any(|g| {
+                        g.gene_name
+                            .as_ref()
+                            .is_some_and(|n| n.value.eq_ignore_ascii_case(query))
+                    })
+                })
+            {
+                exact.retain(|r| {
+                    r.genes.iter().any(|g| {
+                        g.gene_name
+                            .as_ref()
+                            .is_some_and(|n| n.value.eq_ignore_ascii_case(query))
+                    })
+                });
+            }
             if exact
                 .iter()
                 .any(|r| r.entry_type == "UniProtKB reviewed (Swiss-Prot)")
