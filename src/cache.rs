@@ -23,7 +23,7 @@ impl Cache {
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| e.to_string())?;
-        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS cache (query TEXT NOT NULL, organism TEXT NOT NULL, saved INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(query, organism)); CREATE TABLE IF NOT EXISTS kegg_cache (organism TEXT NOT NULL, stage TEXT NOT NULL, identifier TEXT NOT NULL, saved INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(organism, stage, identifier));").map_err(|e| e.to_string())?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS cache (query TEXT NOT NULL, organism TEXT NOT NULL, saved INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(query, organism)); CREATE TABLE IF NOT EXISTS analysis_cache (id TEXT PRIMARY KEY, saved INTEGER NOT NULL, result TEXT NOT NULL); CREATE TABLE IF NOT EXISTS kegg_cache (organism TEXT NOT NULL, stage TEXT NOT NULL, identifier TEXT NOT NULL, saved INTEGER NOT NULL, result TEXT NOT NULL, PRIMARY KEY(organism, stage, identifier));").map_err(|e| e.to_string())?;
         let ttl = ttl_days
             .checked_mul(86400)
             .and_then(|x| i64::try_from(x).ok())
@@ -32,6 +32,59 @@ impl Cache {
             connection: Arc::new(Mutex::new(connection)),
             ttl,
         })
+    }
+    /// Persistent analysis snapshots and full results share the existing DB and TTL.
+    pub async fn get_analysis<T: serde::de::DeserializeOwned + Send + 'static>(
+        &self,
+        id: &str,
+    ) -> Result<Option<T>, String> {
+        let this = self.clone();
+        let id = id.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let conn = this.connection.lock().map_err(|e| e.to_string())?;
+            let value: Option<String> = conn
+                .query_row(
+                    "SELECT result FROM analysis_cache WHERE id=?1 AND saved>?2 AND saved<=?3",
+                    params![id, now() - this.ttl, now()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| e.to_string())?;
+            value
+                .map(|v| serde_json::from_str(&v).map_err(|e| e.to_string()))
+                .transpose()
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+    pub async fn put_analysis<T: serde::Serialize + Send + 'static>(
+        &self,
+        id: Option<String>,
+        value: T,
+    ) -> Result<String, String> {
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let value = serde_json::to_string(&value).map_err(|e| e.to_string())?;
+            let conn = this.connection.lock().map_err(|e| e.to_string())?;
+            let id = match id {
+                Some(id) => id,
+                None => conn
+                    .query_row(
+                        "SELECT 'result_' || lower(hex(randomblob(16)))",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(|e| e.to_string())?,
+            };
+            conn.execute(
+                "INSERT OR REPLACE INTO analysis_cache VALUES (?1, ?2, ?3)",
+                params![id, now(), value],
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(id)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
     pub async fn get(&self, key: (String, String)) -> Result<Option<ProteinResult>, String> {
         let this = self.clone();

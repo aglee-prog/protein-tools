@@ -7,3 +7,5 @@ pub mod uniprot;
 pub mod upstream;
 
 pub mod kegg_compare;
+
+pub mod enrichment;

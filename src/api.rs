@@ -1,3 +1,4 @@
+use crate::enrichment::{EnrichmentRequest, EnrichmentResponse, valid_result_id};
 use crate::kegg_compare::{KeggCompareRequest, KeggCompareResponse};
 use crate::{
     cache::Cache,
@@ -7,8 +8,8 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    extract::{Path, State, rejection::JsonRejection},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use futures::{StreamExt, stream};
@@ -113,12 +114,12 @@ impl App {
     }
 }
 #[utoipa::path(post, path="/protein-info", operation_id="lookupProteinInfo", request_body=ProteinRequest,
-    responses((status=200, description="One result per input, in input order. query, found, cached, and error are always returned; selected fields are included when available. error may indicate incomplete QuickGO annotations.", body=Vec<ProteinResponse>), (status=400, description="Invalid batch size, organism, include value, or GO limit")))]
+    responses((status=200, description="One result per input, in input order. query, found, cached, and error are always returned; selected fields are included when available. error may indicate incomplete QuickGO annotations.", body=Vec<ProteinResponse>, headers(("X-Result-Id" = String, description="Full cached result ID, when storage succeeds; accepted by enrich_proteins"))), (status=400, description="Invalid batch size, organism, include value, or GO limit")))]
 /// Look up authoritative UniProt and Gene Ontology information for a protein set. Send the complete protein set in one request. Select only the information needed using `include` and control GO response size with `max_go_terms_per_protein`. The service handles batching, concurrency, and caching internally.
 async fn protein_info(
     State(app): State<App>,
     request: Result<Json<ProteinRequest>, JsonRejection>,
-) -> Result<Json<Vec<ProteinResponse>>, (StatusCode, String)> {
+) -> Result<(HeaderMap, Json<Vec<ProteinResponse>>), (StatusCode, String)> {
     let Json(request) = request.map_err(|error| (StatusCode::BAD_REQUEST, error.body_text()))?;
     if request.proteins.is_empty() || request.proteins.len() > MAX_REQUEST_PROTEINS {
         return Err((
@@ -141,12 +142,30 @@ async fn protein_info(
     }
     let include = request.include.clone().unwrap_or_else(default_include);
     let limit = request.max_go_terms_per_protein;
-    Ok(Json(
-        app.batch(request)
-            .await
-            .into_iter()
-            .map(|result| result.select(&include, limit))
-            .collect(),
+    let proteins = request.proteins.clone();
+    let results = app.batch(request).await;
+    let mut headers = HeaderMap::new();
+    match app
+        .cache
+        .put_analysis(
+            None,
+            serde_json::json!({"proteins": proteins, "items": results}),
+        )
+        .await
+    {
+        Ok(id) => {
+            headers.insert("x-result-id", id.parse().expect("generated result ID"));
+        }
+        Err(error) => tracing::warn!(event="result_cache_write_failure", %error),
+    }
+    Ok((
+        headers,
+        Json(
+            results
+                .into_iter()
+                .map(|result| result.select(&include, limit))
+                .collect(),
+        ),
     ))
 }
 #[utoipa::path(post, path="/kegg-pathways", operation_id="lookupKeggPathways", request_body=KeggRequest,
@@ -210,14 +229,56 @@ async fn compare_kegg_pathways(
         app.kegg.compare(&app.cache, &app.upstream, request).await,
     ))
 }
+#[utoipa::path(post, path="/enrich-proteins", operation_id="enrich_proteins", request_body=EnrichmentRequest,
+    responses((status=200, description="Compact GO BP overrepresentation result; complete data saved under result_id", body=EnrichmentResponse), (status=400, description="Invalid input or protein outside human background"), (status=404, description="Result absent or expired"), (status=502, description="Upstream data unavailable or incomplete"), (status=500, description="Result cache or calculation failed")))]
+/// Run deterministic human GO Biological Process enrichment before inspecting raw annotations. Supply proteins OR result_id. Uses the entire UniProt human proteome, a one-sided hypergeometric test and Benjamini-Hochberg FDR over all background terms. Returns at most ten terms; use result_id to retrieve the complete cached result. Cold background loading requires paginated UniProt requests.
+async fn enrich_proteins(
+    State(app): State<App>,
+    request: Result<Json<EnrichmentRequest>, JsonRejection>,
+) -> Result<Json<EnrichmentResponse>, (StatusCode, String)> {
+    let Json(request) = request.map_err(|e| (StatusCode::BAD_REQUEST, e.body_text()))?;
+    app.enrich(request).await.map(Json)
+}
+#[utoipa::path(get, path="/results/{result_id}", operation_id="getCachedResult", params(("result_id" = String, Path, description="Cached result ID")),
+    responses((status=200, description="Complete cached protein or enrichment result", body=serde_json::Value), (status=400, description="Invalid ID"), (status=404, description="Missing or expired result"), (status=500, description="Cache failure")))]
+/// Retrieve a complete cached result. Results may be large; only call when full data is needed.
+async fn cached_result(
+    State(app): State<App>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if !valid_result_id(&id) {
+        return Err((StatusCode::BAD_REQUEST, "invalid result_id".into()));
+    }
+    app.cache
+        .get_analysis(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map(Json)
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            "result_id not found or expired".into(),
+        ))
+}
 #[utoipa::path(get, path="/health", operation_id="health", responses((status=200, description="Service is running; upstream reachability is not checked")))]
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({"status":"ok"}))
 }
 #[derive(OpenApi)]
 #[openapi(
-    paths(protein_info, kegg_pathways, compare_kegg_pathways, health),
+    paths(
+        protein_info,
+        kegg_pathways,
+        compare_kegg_pathways,
+        enrich_proteins,
+        cached_result,
+        health
+    ),
     components(schemas(
+        EnrichmentRequest,
+        EnrichmentResponse,
+        crate::enrichment::EnrichmentResult,
+        crate::enrichment::EnrichmentTerm,
+        crate::enrichment::TopTerm,
         KeggCompareRequest,
         KeggCompareResponse,
         crate::kegg_compare::KeggCompareProtein,
@@ -239,6 +300,8 @@ pub struct ApiDoc;
 pub fn router(app: App) -> Router {
     Router::new()
         .route("/protein-info", post(protein_info))
+        .route("/enrich-proteins", post(enrich_proteins))
+        .route("/results/{result_id}", get(cached_result))
         .route("/kegg-pathways", post(kegg_pathways))
         .route("/compare-kegg-pathways", post(compare_kegg_pathways))
         .route("/health", get(health))

@@ -1,6 +1,6 @@
 # protein-tools
 
-Small Rust OpenAPI tool server for authoritative UniProt protein facts and QuickGO annotations. It performs exact lookup and normalization only, with no biological interpretation or classification.
+Small Rust OpenAPI tool server for authoritative UniProt protein facts and QuickGO annotations. It performs exact lookup and normalization, plus deterministic human GO Biological Process overrepresentation analysis.
 
 ## Run
 
@@ -84,7 +84,7 @@ Resolution tries the exact accession first, then `gene_exact`. Invalid-accession
 
 `found` indicates successful UniProt resolution. When QuickGO fails, protein facts remain available with an explicit `error`, an empty annotation list, and no cache write. Consumers must check `error` before treating annotations as complete. Not-found has `found: false` and `error: null`; failures and ambiguity have an error message.
 
-QuickGO pages are fetched sequentially, up to 100 pages of 200 records. Exceeding the limit fails explicitly without caching a partial result. Only annotations for the exact resolved accession are retained. Duplicate normalized tuples are removed. GO qualifiers are retained alongside GO ID, aspect, and evidence, including negation. References and other raw annotation metadata are not returned. No interpretation or term enrichment is performed.
+QuickGO pages are fetched sequentially, up to 100 pages of 200 records. Exceeding the limit fails explicitly without caching a partial result. Only annotations for the exact resolved accession are retained. Duplicate normalized tuples are removed. GO qualifiers are retained alongside GO ID, aspect, and evidence, including negation. References and other raw annotation metadata are not returned. The protein-info endpoint performs no enrichment; use enrich_proteins for deterministic GO BP analysis.
 
 The final successful normalized result is cached under trimmed, case-normalized query and organism keys. Selection and GO limits are applied after reading the complete record, so they do not create separate cache entries. A fresh identity/function-only request still fetches QuickGO to populate that complete record for later requests. TTL uses write time; reads do not refresh it. On hits the original request query is restored and `cached` is true, without upstream requests. Not-found and incomplete/error results are not cached. SQLite uses WAL, a busy timeout, and a mutex on a shared connection; database operations run on Tokio's blocking pool. Cache errors are logged and lookups remain available. Expired keys are replaced on a subsequent successful lookup; there is no background cleanup worker.
 
@@ -108,7 +108,7 @@ Upstream API references: [UniProt query fields](https://www.uniprot.org/help/que
 
 `POST /kegg-pathways`, OpenAPI operation **`lookupKeggPathways`**, accepts 1–500
 canonical UniProt accessions from any organism, including mixed-organism sets.
-This repository exposes OpenAPI operations for tool consumers; it does not implement a native MCP transport or a `result_id` store.
+This repository exposes OpenAPI operations for tool consumers; it does not implement a native MCP transport. Full protein and enrichment results are available through the SQLite `result_id` store described below.
 Existing UniProt/QuickGO behavior is unchanged.
 
 ```json
@@ -268,3 +268,89 @@ validates the remaining five digits, preserving leading zeros. Thus `hsa04151`,
 Names never establish equivalence. The final ` - organism` catalog suffix is removed
 for display; if normalized names differ, the lexically first available name is used.
 No cache tables, cache keys, or existing lookup request/response schemas change.
+
+
+## Stage 1: GO Biological Process enrichment
+
+`POST /enrich-proteins`, OpenAPI operation **`enrich_proteins`**, accepts exactly
+one of `proteins` (1–500 gene symbols or UniProt accessions) or `result_id`.
+Only `source="go_bp"` and `background="human_proteome"` are supported and are
+the defaults. Prefer this deterministic tool before inspecting large annotation
+sets; the model chooses the analysis, while the service calculates statistics.
+
+```sh
+curl --fail-with-body http://127.0.0.1:8091/enrich-proteins \
+  -H 'Content-Type: application/json' \
+  -d '{"proteins":["TP53","EGFR","AKT1"],"source":"go_bp","background":"human_proteome"}'
+```
+
+The compact response contains `result_id`, `method`, `source`, `background`,
+`input_count`, `background_count`, `tested_terms`, `significant_terms`,
+`fdr_threshold` (0.05), and at most ten `top_terms` with GO ID, name, hit count,
+p-value and FDR. Terms are ordered by FDR, p-value, then GO ID. Top terms may
+be nonsignificant; use their FDR rather than interpreting their presence as
+significance. Protein lists and the full term collection stay outside this response.
+
+`GET /results/{result_id}` retrieves the complete saved result, including every
+tested term, hit accessions, input and background counts, p-values, FDR, resolved
+input accessions, UniProt release, background query and annotation policy.
+`POST /enrich-proteins` with `{"result_id":"result_..."}` reanalyzes that protein
+set using the currently cached background. The generic full-result endpoint is
+intended for explicit retrieval; term-level drill-down remains Stage 2.
+
+`POST /protein-info` retains its existing JSON array response and additionally
+returns `X-Result-Id` when storage succeeds. That ID identifies the full unfiltered
+protein batch (`proteins` and `items`) and can be supplied to enrichment. Cached
+batches containing unresolved or nonhuman records are rejected; original gene
+symbols are not reinterpreted across species. If saving a protein batch fails,
+the lookup still succeeds without the header; an enrichment cache-write failure
+returns HTTP 500 rather than an unusable result ID. Tool clients that do not
+expose response headers can supply `proteins` directly.
+
+### Population and annotation policy
+
+The background is **all primary UniProtKB entries** selected by
+`proteome:UP000005640 AND organism_id:9606`, including reviewed and unreviewed
+entries and proteins without GO BP annotations. This is an accession-level
+population, not a fixed 20,000-gene universe or a one-protein-per-gene subset.
+Its actual size is returned; the supplied input never replaces the background.
+The existing exact human UniProt resolver and protein cache resolve inputs.
+Aliases and repeated accessions count once. Unknown/ambiguous identifiers,
+nonhuman proteins, and accessions outside the selected proteome fail explicitly;
+no proteins are silently dropped.
+
+Both input and background term membership come from the **same complete
+UniProt `go_p` snapshot**. This reuses the existing UniProt client and avoids
+mixing input QuickGO annotations with a different background release or making
+one QuickGO request per proteome entry. Existing QuickGO lookup behavior is
+unchanged. The analysis uses UniProt's positive BP associations with all evidence,
+without adding ancestor propagation; it excludes the BP root `GO:0008150`.
+It therefore analyzes the associations supplied by UniProt, and is not an
+ancestor-expanded GO analysis. Unannotated input proteins remain in the draw size.
+
+A one-sided hypergeometric survival probability, `P(X >= observed_hits)`, is
+computed with `statrs`, equivalent to the enrichment tail of Fisher's exact test.
+Benjamini–Hochberg adjustment covers **every non-root BP term observed in the
+background**, including terms with zero input hits (p = 1). Membership is a set,
+so duplicate annotation records cannot inflate counts.
+
+The first request downloads the paginated background (500 records per page,
+at most 1,000 pages), which can take several minutes. Subsequent requests reuse
+the complete snapshot. Page totals, unique accession counts and UniProt releases
+are checked; HTTP errors, malformed data, truncation or release changes fail with
+HTTP 502 and never cache a partial background. No automatic retries are added.
+Background loading shares the existing concurrency semaphore. Simultaneous cold
+requests can duplicate the load, so warm the cache with one request first.
+
+Snapshots and results use a small `analysis_cache` table in the existing SQLite
+file and the existing `CACHE_TTL_DAYS`. They survive restart, expire from write
+time, and are not served after expiration. Missing/expired result IDs return
+HTTP 404; malformed requests return 400. TTL zero disables retrieval, including
+immediate result retrieval. Expired rows have no automatic cleanup, consistent
+with the existing cache. No Reactome, KEGG enrichment, GSEA, hierarchy reduction,
+network analysis, group comparison or visualization is added by this stage.
+
+References: [UniProt API queries](https://www.uniprot.org/help/api_queries),
+[UniProt return fields](https://www.uniprot.org/help/return_fields),
+[UniProt proteomes](https://www.uniprot.org/help/proteome), and
+[statrs Hypergeometric](https://docs.rs/statrs/0.18.0/statrs/distribution/struct.Hypergeometric.html).
